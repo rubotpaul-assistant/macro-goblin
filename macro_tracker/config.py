@@ -13,6 +13,7 @@ class Settings:
 
     database_path: Path
     spreadsheet_id: str | None
+    user_slug: str = "geoff"
 
     @classmethod
     def from_environment(cls) -> Settings:
@@ -20,4 +21,5 @@ class Settings:
         return cls(
             database_path=Path(os.getenv("MACRO_DATABASE_PATH", "data/macro.sqlite3")),
             spreadsheet_id=os.getenv("MACRO_SPREADSHEET_ID") or os.getenv("GYM_SPREADSHEET_ID"),
+            user_slug=os.getenv("MACRO_USER_SLUG", "geoff"),
         )

@@ -22,15 +22,23 @@ log_app = typer.Typer(no_args_is_help=True)
 history_app = typer.Typer(no_args_is_help=True)
 summary_app = typer.Typer(no_args_is_help=True)
 sheets_app = typer.Typer(no_args_is_help=True)
+user_app = typer.Typer(no_args_is_help=True)
 app.add_typer(item_app, name="item")
 app.add_typer(log_app, name="log")
 app.add_typer(history_app, name="history")
 app.add_typer(summary_app, name="summary")
 app.add_typer(sheets_app, name="sheets")
+app.add_typer(user_app, name="user")
 
 
 def _service() -> MacroService:
-    return MacroService(Database(Settings.from_environment().database_path))
+    settings = Settings.from_environment()
+    return MacroService(Database(settings.database_path), settings.user_slug)
+
+
+def _admin_service() -> MacroService:
+    settings = Settings.from_environment()
+    return MacroService(Database(settings.database_path))
 
 
 def _emit(payload: dict[str, Any]) -> None:
@@ -56,6 +64,21 @@ def _profile(calories: str, protein_g: str, carbs_g: str, fat_g: str, fiber_g: s
         )
     except InvalidOperation as error:
         raise MacroError("macro values must be numeric") from error
+
+
+@user_app.command("add")
+def user_add(
+    slug: str,
+    display_name: Annotated[str, typer.Option("--display-name")],
+) -> None:
+    """Add a user with an isolated catalog and history."""
+    _run(_admin_service().add_user, slug, display_name)
+
+
+@user_app.command("list")
+def user_list() -> None:
+    """List active users."""
+    _run(_admin_service().list_users)
 
 
 @item_app.command("add")
