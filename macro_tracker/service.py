@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal
+from sqlite3 import IntegrityError
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -20,9 +21,44 @@ class MacroError(Exception):
 class MacroService:
     """Own all canonical macro-tracking mutations and queries."""
 
-    def __init__(self, database: Database) -> None:
+    def __init__(self, database: Database, user_slug: str = "geoff") -> None:
         self.database = database
         self.database.initialize()
+        with self.database.connect() as connection:
+            user = connection.execute(
+                "SELECT id,slug FROM users WHERE active=1 AND slug=? COLLATE NOCASE",
+                (user_slug.strip(),),
+            ).fetchone()
+        if user is None:
+            raise MacroError(f"unknown user: {user_slug}")
+        self.user_id = int(user["id"])
+        self.user_slug = str(user["slug"])
+
+    def add_user(self, slug: str, display_name: str) -> dict[str, Any]:
+        """Create a user who owns an isolated catalog and consumption history."""
+        clean_slug = slug.strip().lower()
+        clean_name = display_name.strip()
+        if not clean_slug or not clean_name:
+            raise MacroError("user slug and display name are required")
+        if not clean_slug.replace("-", "").isalnum():
+            raise MacroError("user slug may contain only letters, numbers, and hyphens")
+        with self.database.connect() as connection:
+            try:
+                cursor = connection.execute(
+                    "INSERT INTO users(slug,display_name,created_at) VALUES(?,?,?)",
+                    (clean_slug, clean_name, datetime.now(tz=PACIFIC).isoformat()),
+                )
+            except IntegrityError as error:
+                raise MacroError(f"user already exists: {clean_slug}") from error
+        return {"ok": True, "user_id": int(cursor.lastrowid or 0), "slug": clean_slug}
+
+    def list_users(self) -> dict[str, Any]:
+        """List active users without exposing unrelated state."""
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                "SELECT id,slug,display_name FROM users WHERE active=1 ORDER BY slug"
+            ).fetchall()
+        return {"ok": True, "users": [dict(row) for row in rows]}
 
     def add_item(
         self,
@@ -43,17 +79,19 @@ class MacroService:
         values = profile.as_strings()
         with self.database.connect() as connection:
             existing = connection.execute(
-                "SELECT id FROM food_items WHERE name=? COLLATE NOCASE", (clean_name,)
+                "SELECT id FROM food_items WHERE user_id=? AND name=? COLLATE NOCASE",
+                (self.user_id, clean_name),
             ).fetchone()
             if existing is not None and not replace:
                 raise MacroError(f"item already exists: {clean_name}")
             if existing is None:
                 cursor = connection.execute(
                     """INSERT INTO food_items(
-                    name,serving_description,calories,protein_g,carbs_g,fat_g,fiber_g,
+                    user_id,name,serving_description,calories,protein_g,carbs_g,fat_g,fiber_g,
                     source_type,source_notes,created_at,updated_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
+                        self.user_id,
                         clean_name,
                         clean_serving,
                         values["calories"],
@@ -92,6 +130,7 @@ class MacroService:
             "item_id": item_id,
             "name": clean_name,
             "replaced": existing is not None,
+            "user_slug": self.user_slug,
         }
 
     def search_items(self, query: str) -> dict[str, Any]:
@@ -100,10 +139,10 @@ class MacroService:
             rows = connection.execute(
                 """SELECT id,name,serving_description,calories,protein_g,carbs_g,fat_g,
                 fiber_g,source_type,source_notes FROM food_items
-                WHERE active=1 AND name LIKE ? ORDER BY name""",
-                (f"%{query.strip()}%",),
+                WHERE user_id=? AND active=1 AND name LIKE ? ORDER BY name""",
+                (self.user_id, f"%{query.strip()}%"),
             ).fetchall()
-        return {"ok": True, "items": [dict(row) for row in rows]}
+        return {"ok": True, "user_slug": self.user_slug, "items": [dict(row) for row in rows]}
 
     def log_item(
         self,
@@ -128,7 +167,9 @@ class MacroService:
         timestamp = timestamp.astimezone(PACIFIC)
         with self.database.connect() as connection:
             item = connection.execute(
-                "SELECT * FROM food_items WHERE active=1 AND name=? COLLATE NOCASE", (name,)
+                """SELECT * FROM food_items
+                WHERE user_id=? AND active=1 AND name=? COLLATE NOCASE""",
+                (self.user_id, name),
             ).fetchone()
             if item is None:
                 raise MacroError(f"unknown item: {name}")
@@ -142,10 +183,11 @@ class MacroService:
             values = profile.as_strings()
             cursor = connection.execute(
                 """INSERT INTO consumption_entries(
-                food_item_id,consumed_at,local_date,item_name,serving_description,servings,
+                user_id,food_item_id,consumed_at,local_date,item_name,serving_description,servings,
                 calories,protein_g,carbs_g,fat_g,fiber_g,source_type,source_notes,notes
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
+                    self.user_id,
                     item["id"],
                     timestamp.isoformat(),
                     timestamp.date().isoformat(),
@@ -173,6 +215,7 @@ class MacroService:
             "servings": format(servings, "f"),
             "totals": values,
             "sync_pending": True,
+            "user_slug": self.user_slug,
         }
 
     def recent_history(self, limit: int = 20) -> dict[str, Any]:
@@ -183,10 +226,12 @@ class MacroService:
             rows = connection.execute(
                 """SELECT id,consumed_at,local_date,item_name,serving_description,servings,
                 calories,protein_g,carbs_g,fat_g,fiber_g,source_type,source_notes,notes
-                FROM consumption_entries ORDER BY consumed_at DESC,id DESC LIMIT ?""",
-                (limit,),
+                FROM consumption_entries WHERE user_id=?
+                ORDER BY consumed_at DESC,id DESC LIMIT ?""",
+                (self.user_id, limit),
             ).fetchall()
-        return {"ok": True, "entries": [dict(row) for row in rows]}
+        entries = [{"user_slug": self.user_slug, **dict(row)} for row in rows]
+        return {"ok": True, "user_slug": self.user_slug, "entries": entries}
 
     def daily_summary(self, local_date: str) -> dict[str, Any]:
         """Aggregate stored snapshots for one Pacific local date."""
@@ -199,8 +244,8 @@ class MacroService:
         with self.database.connect() as connection:
             rows = connection.execute(
                 """SELECT calories,protein_g,carbs_g,fat_g,fiber_g
-                FROM consumption_entries WHERE local_date=?""",
-                (local_date,),
+                FROM consumption_entries WHERE user_id=? AND local_date=?""",
+                (self.user_id, local_date),
             ).fetchall()
         totals = MacroProfile(
             *(
@@ -213,4 +258,5 @@ class MacroService:
             "date": local_date,
             "item_count": len(rows),
             "totals": totals.as_strings(),
+            "user_slug": self.user_slug,
         }

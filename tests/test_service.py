@@ -62,6 +62,30 @@ def test_summary_aggregates_item_snapshots_for_local_date(service: MacroService)
     assert summary["item_count"] == 1
 
 
+def test_users_have_isolated_catalogs_and_history(tmp_path: Path) -> None:
+    database = Database(tmp_path / "macro.sqlite3")
+    geoff = MacroService(database)
+    geoff.add_user("freedom", "Freedom")
+    freedom = MacroService(database, "freedom")
+    geoff.add_item("Shake", "Geoff serving", profile(), SourceType.LABEL)
+    freedom.add_item("Shake", "Freedom serving", profile(), SourceType.MANUAL)
+    geoff.log_item("Shake", Decimal("1"), datetime(2026, 8, 17, 19, tzinfo=UTC))
+    freedom.log_item("Shake", Decimal("2"), datetime(2026, 8, 17, 20, tzinfo=UTC))
+
+    assert geoff.search_items("Shake")["items"][0]["serving_description"] == "Geoff serving"
+    assert freedom.search_items("Shake")["items"][0]["serving_description"] == "Freedom serving"
+    assert geoff.daily_summary("2026-08-17")["item_count"] == 1
+    assert freedom.daily_summary("2026-08-17")["totals"]["calories"] == "300.000"
+    assert geoff.recent_history()["entries"][0]["user_slug"] == "geoff"
+
+
+def test_unknown_user_is_clear_error(tmp_path: Path) -> None:
+    database = Database(tmp_path / "macro.sqlite3")
+    MacroService(database)
+    with pytest.raises(MacroError, match="unknown user"):
+        MacroService(database, "nobody")
+
+
 def test_log_rejects_non_positive_servings(service: MacroService) -> None:
     service.add_item("Shake", "1 bottle", profile(), SourceType.LABEL)
     with pytest.raises(MacroError, match="servings must be positive"):

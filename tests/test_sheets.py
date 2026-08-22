@@ -35,7 +35,9 @@ def test_sync_projects_item_level_snapshots(tmp_path: Path) -> None:
 
     assert result == {"ok": True, "rows": 1, "pending": False}
     assert writer.calls[0][1] == "Macro Log"
-    assert writer.calls[0][2][1][2] == "Shake"
+    assert writer.calls[0][2][0][0] == "User"
+    assert writer.calls[0][2][1][0] == "geoff"
+    assert writer.calls[0][2][1][3] == "Shake"
 
 
 def test_sync_requires_spreadsheet_id(tmp_path: Path) -> None:

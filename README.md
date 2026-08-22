@@ -12,9 +12,10 @@ a nutrition label or estimate a complex meal, but it must declare the provenance
 ## Data model
 
 - **Food item:** a reusable per-serving nutrient profile, such as one protein shake, hamburger, or
-  Honeycrisp apple.
-- **Consumption entry:** an immutable item-level snapshot scaled by servings. Updating a reusable
-  item never rewrites history.
+  Honeycrisp apple. Names are unique within a user's catalog.
+- **User:** an owner of an isolated food catalog and consumption history. `geoff` is the default.
+- **Consumption entry:** an immutable, user-owned item-level snapshot scaled by servings. Updating
+  a reusable item never rewrites history.
 - **Sync state:** records whether canonical SQLite changes still need projection.
 
 All nutrient arithmetic uses `Decimal`; JSON and SQLite store normalized fixed-point strings.
@@ -48,6 +49,10 @@ macro history recent --limit 20
 macro summary day 2026-08-17
 macro sheets status
 macro sheets sync
+
+# Add another user, then select that user for normal commands
+macro user add freedom --display-name Freedom
+MACRO_USER_SLUG=freedom macro item search "shake"
 ```
 
 Commands emit stable JSON for agent use. Existing item definitions require explicit `--replace`
@@ -56,6 +61,7 @@ before future logs use revised values.
 ## Runtime configuration
 
 - `MACRO_DATABASE_PATH` — defaults to `data/macro.sqlite3`
+- `MACRO_USER_SLUG` — active user for catalog/history commands; defaults to `geoff`
 - `MACRO_SPREADSHEET_ID` — destination spreadsheet
 - `GYM_SPREADSHEET_ID` — fallback, allowing the linked Iron Goblin spreadsheet to be reused
 - `GOOGLE_SERVICE_ACCOUNT_CREDENTIALS_JSON` — the same runtime-managed inline JSON or credential

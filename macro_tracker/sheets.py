@@ -70,6 +70,7 @@ class SheetsService:
     @staticmethod
     def _history_rows(connection: sqlite3.Connection) -> list[list[Any]]:
         header = [
+            "User",
             "Consumed At",
             "Local Date",
             "Item",
@@ -85,9 +86,11 @@ class SheetsService:
             "Notes",
         ]
         records = connection.execute(
-            """SELECT consumed_at,local_date,item_name,serving_description,servings,calories,
+            """SELECT users.slug,consumed_at,local_date,item_name,serving_description,servings,
+            calories,
             protein_g,carbs_g,fat_g,fiber_g,source_type,source_notes,notes
-            FROM consumption_entries ORDER BY consumed_at,id"""
+            FROM consumption_entries JOIN users ON users.id=consumption_entries.user_id
+            ORDER BY consumed_at,consumption_entries.id"""
         ).fetchall()
         return [header, *[list(record) for record in records]]
 

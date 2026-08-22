@@ -49,6 +49,19 @@ def test_cli_add_log_summary_and_history(tmp_path: Path, monkeypatch: pytest.Mon
     assert json.loads(sync_status.stdout)["configured"] is False
 
 
+def test_cli_can_add_list_and_select_users(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    database = tmp_path / "macro.sqlite3"
+    monkeypatch.setenv("MACRO_DATABASE_PATH", str(database))
+    added = runner.invoke(app, ["user", "add", "freedom", "--display-name", "Freedom"])
+    listed = runner.invoke(app, ["user", "list"])
+    monkeypatch.setenv("MACRO_USER_SLUG", "freedom")
+    searched = runner.invoke(app, ["item", "search", "anything"])
+
+    assert added.exit_code == listed.exit_code == searched.exit_code == 0
+    assert [user["slug"] for user in json.loads(listed.stdout)["users"]] == ["freedom", "geoff"]
+    assert json.loads(searched.stdout)["user_slug"] == "freedom"
+
+
 def datetime_now_pacific_date() -> str:
     from datetime import datetime
     from zoneinfo import ZoneInfo
