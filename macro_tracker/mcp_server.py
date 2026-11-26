@@ -25,7 +25,11 @@ from starlette.types import Scope as ASGIScope
 from macro_tracker.access import AccessDenied, AccessUnavailable, AuthorizedConnection, Authorizer
 from macro_tracker.access import Scope as NutritionScope
 from macro_tracker.api import (
+    ConsumptionDeletion,
+    CorrectedConsumption,
+    CorrectionInput,
     DailyTotals,
+    DeletionInput,
     FoodSearch,
     History,
     KnownFoodInput,
@@ -33,6 +37,8 @@ from macro_tracker.api import (
     LoggedFood,
     NewFoodInput,
     account_service,
+    apply_correction,
+    apply_deletion,
     domain_error_status,
     record_known_food,
     record_new_food,
@@ -65,6 +71,14 @@ class KnownFoodArguments(KnownFoodInput):
     food_id: int = Field(gt=0, le=2**63 - 1, strict=True)
 
 
+class CorrectionArguments(CorrectionInput):
+    entry_id: int = Field(gt=0, le=2**63 - 1, strict=True)
+
+
+class DeletionArguments(DeletionInput):
+    entry_id: int = Field(gt=0, le=2**63 - 1, strict=True)
+
+
 @dataclass(frozen=True)
 class Operation[InputT: BaseModel]:
     description: str
@@ -72,6 +86,7 @@ class Operation[InputT: BaseModel]:
     input_model: type[InputT]
     output_model: type[BaseModel]
     execute: Callable[[MacroService, InputT], dict[str, Any]]
+    destructive: bool = False
 
     def describe(self, name: str) -> types.Tool:
         read_only = self.scope is NutritionScope.READ
@@ -82,7 +97,7 @@ class Operation[InputT: BaseModel]:
             outputSchema=self.output_model.model_json_schema(mode="serialization"),
             annotations=types.ToolAnnotations(
                 readOnlyHint=read_only,
-                destructiveHint=False,
+                destructiveHint=self.destructive,
                 idempotentHint=True,
                 openWorldHint=False,
             ),
@@ -148,6 +163,24 @@ OPERATIONS: dict[str, Operation[Any]] = {
         NewFoodInput,
         LoggedFood,
         record_new_food,
+    ),
+    "macro_correct_consumption": Operation(
+        "Correct the amount, local date, or notes for one current entry selected from history. "
+        "Use its entry ID, confirm ambiguity with the user, and reuse the client key on retry. "
+        "The result returns the replacement entry ID.",
+        NutritionScope.WRITE,
+        CorrectionArguments,
+        CorrectedConsumption,
+        lambda service, values: apply_correction(service, values.entry_id, values),
+    ),
+    "macro_delete_consumption": Operation(
+        "Delete one current entry from history and totals after the user explicitly confirms "
+        "the selected entry ID. Reuse the same client key when retrying a confirmed deletion.",
+        NutritionScope.WRITE,
+        DeletionArguments,
+        ConsumptionDeletion,
+        lambda service, values: apply_deletion(service, values.entry_id, values),
+        destructive=True,
     ),
 }
 
