@@ -35,6 +35,7 @@ TRACKING_SCHEMA = (
  active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
  created_at TEXT NOT NULL,
  updated_at TEXT NOT NULL,
+ profile_version INTEGER NOT NULL DEFAULT 1,
  UNIQUE(user_id,name),
  UNIQUE(id,user_id)
 )""",
@@ -59,6 +60,15 @@ TRACKING_SCHEMA = (
 )""",
     """CREATE INDEX IF NOT EXISTS ix_consumption_user_local_date
     ON consumption_entries(user_id,local_date,consumed_at)""",
+    """CREATE TABLE IF NOT EXISTS logging_receipts (
+ user_id INTEGER NOT NULL REFERENCES users(id),
+ operation TEXT NOT NULL,
+ client_key TEXT NOT NULL,
+ request_hash TEXT NOT NULL,
+ entry_id INTEGER NOT NULL,
+ response_json TEXT NOT NULL,
+ PRIMARY KEY(user_id,operation,client_key)
+)""",
 )
 
 SYNC_SCHEMA = """
@@ -87,10 +97,18 @@ class Database:
         try:
             connection.execute("PRAGMA foreign_keys = OFF")
             connection.executescript(USERS_SCHEMA)
+            connection.executescript(SYNC_SCHEMA)
+            connection.execute("BEGIN IMMEDIATE")
             if self._needs_user_migration(connection):
                 self._migrate_legacy_tracking_tables(connection)
             self._create_tracking_tables(connection)
-            connection.executescript(SYNC_SCHEMA)
+            food_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(food_items)")
+            }
+            if "profile_version" not in food_columns:
+                connection.execute(
+                    "ALTER TABLE food_items ADD COLUMN profile_version INTEGER NOT NULL DEFAULT 1"
+                )
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(sync_state)")}
             if "revision" not in columns:
                 connection.execute(
@@ -121,34 +139,26 @@ class Database:
 
     @staticmethod
     def _migrate_legacy_tracking_tables(connection: sqlite3.Connection) -> None:
-        connection.execute("BEGIN IMMEDIATE")
-        try:
-            connection.execute("ALTER TABLE food_items RENAME TO legacy_food_items")
-            connection.execute(
-                "ALTER TABLE consumption_entries RENAME TO legacy_consumption_entries"
-            )
-            Database._create_tracking_tables(connection)
-            connection.execute(
-                """INSERT INTO food_items(
+        connection.execute("ALTER TABLE food_items RENAME TO legacy_food_items")
+        connection.execute("ALTER TABLE consumption_entries RENAME TO legacy_consumption_entries")
+        Database._create_tracking_tables(connection)
+        connection.execute(
+            """INSERT INTO food_items(
                 id,user_id,name,serving_description,calories,protein_g,carbs_g,fat_g,fiber_g,
                 source_type,source_notes,active,created_at,updated_at
                 ) SELECT id,1,name,serving_description,calories,protein_g,carbs_g,fat_g,fiber_g,
                 source_type,source_notes,active,created_at,updated_at FROM legacy_food_items"""
-            )
-            connection.execute(
-                """INSERT INTO consumption_entries(
+        )
+        connection.execute(
+            """INSERT INTO consumption_entries(
                 id,user_id,food_item_id,consumed_at,local_date,item_name,serving_description,
                 servings,calories,protein_g,carbs_g,fat_g,fiber_g,source_type,source_notes,notes
                 ) SELECT id,1,food_item_id,consumed_at,local_date,item_name,serving_description,
                 servings,calories,protein_g,carbs_g,fat_g,fiber_g,source_type,source_notes,notes
                 FROM legacy_consumption_entries"""
-            )
-            connection.execute("DROP TABLE legacy_consumption_entries")
-            connection.execute("DROP TABLE legacy_food_items")
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
+        )
+        connection.execute("DROP TABLE legacy_consumption_entries")
+        connection.execute("DROP TABLE legacy_food_items")
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
