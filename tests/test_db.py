@@ -1,7 +1,10 @@
 import sqlite3
+from decimal import Decimal
 from pathlib import Path
 
 from macro_tracker.db import Database
+from macro_tracker.domain import MacroProfile, SourceType
+from macro_tracker.service import MacroService
 
 
 def test_initialize_migrates_pre_revision_sync_state(tmp_path: Path) -> None:
@@ -89,3 +92,31 @@ def test_initialize_backfills_legacy_rows_to_geoff(tmp_path: Path) -> None:
     assert dict(food) == {"id": 7, "user_id": 1}
     assert dict(entry) == {"id": 9, "user_id": 1, "food_item_id": 7}
     assert foreign_key_errors == []
+
+
+def test_initialize_upgrades_existing_owned_food_for_replay(tmp_path: Path) -> None:
+    database = Database(tmp_path / "pre-replay.sqlite3")
+    profile = MacroProfile(Decimal("50"), Decimal("2"), Decimal("3"), Decimal("1"))
+    operator = MacroService(database)
+    operator.add_user("tester", "Fixture tester")
+    service = MacroService(database, "tester")
+    food_id = service.add_item("Toast", "1 slice", profile, SourceType.LABEL)["item_id"]
+    original = service.log_item("Toast", Decimal("1"))
+    with database.connect() as connection:
+        connection.execute("ALTER TABLE food_items DROP COLUMN profile_version")
+        connection.execute("DROP TABLE logging_receipts")
+
+    reopened = MacroService(database, "tester")
+    assert reopened.search_items("Toast", include_version=True)["items"][0]["profile_version"] == 1
+    assert reopened.recent_history()["entries"][0]["id"] == original["entry_id"]
+    assert "profile_version" not in reopened.search_items("Toast")["items"][0]
+    logged = reopened.log_known_food(
+        food_id, Decimal("2"), client_key="after-upgrade", expected_profile_version=1
+    )
+    assert logged["entry_id"] != original["entry_id"]
+    assert (
+        MacroService(database, "tester").log_known_food(
+            food_id, Decimal("2"), client_key="after-upgrade", expected_profile_version=1
+        )
+        == logged
+    )

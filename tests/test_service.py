@@ -1,12 +1,15 @@
-from datetime import UTC, datetime
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from sqlite3 import IntegrityError
+from threading import Barrier
 
 import pytest
 
 from macro_tracker.db import Database
 from macro_tracker.domain import MacroProfile, SourceType
-from macro_tracker.service import MacroError, MacroService
+from macro_tracker.service import LoggingReplayConflict, MacroError, MacroService, StaleFoodProfile
 
 
 @pytest.fixture
@@ -115,3 +118,155 @@ def test_validation_errors_are_explicit(service: MacroService) -> None:
         service.daily_summary("20260817")
     with pytest.raises(MacroError, match="servings"):
         service.log_item("Shake", Decimal("Infinity"))
+
+
+def test_known_food_replays_original_result_after_profile_replacement(
+    service: MacroService,
+) -> None:
+    food_id = service.add_item("Shake", "1 bottle", profile(), SourceType.LABEL)["item_id"]
+    version = service.search_items("Shake", include_version=True)["items"][0]["profile_version"]
+    timestamp = datetime(2026, 8, 17, 1, tzinfo=UTC)
+    original = service.log_known_food(
+        food_id,
+        Decimal("1.5"),
+        client_key="first",
+        expected_profile_version=version,
+        consumed_at=timestamp,
+        notes="fixture note",
+    )
+    service.add_item("Shake", "1 cup", profile(), SourceType.ESTIMATE, replace=True)
+    reopened = MacroService(service.database)
+    assert (
+        reopened.log_known_food(
+            food_id,
+            Decimal("1.500"),
+            client_key="first",
+            expected_profile_version=version,
+            consumed_at=timestamp.astimezone(timezone(timedelta(hours=-7))),
+            notes="fixture note",
+        )
+        == original
+    )
+    assert original["food_id"] == food_id
+    assert original["source_type"] == "label"
+    assert original["local_date"] == "2026-08-16"
+    assert original["totals"]["calories"] == "225.000"
+    with pytest.raises(LoggingReplayConflict):
+        reopened.log_known_food(food_id, Decimal("2"), client_key="first")
+    with pytest.raises(StaleFoodProfile):
+        reopened.log_known_food(
+            food_id, Decimal("1.5"), client_key="second", expected_profile_version=version
+        )
+    assert len(reopened.recent_history()["entries"]) == 1
+    updated = reopened.log_known_food(food_id, Decimal("1.5"), client_key="second")
+    repeat = reopened.log_known_food(food_id, Decimal("1.5"), client_key="third")
+    assert updated["entry_id"] != repeat["entry_id"]
+    assert updated["source_type"] == "estimate"
+    assert updated["profile_version"] == version + 1
+    assert reopened.log_known_food(food_id, Decimal("1.5"), client_key="second") == updated
+    saved = next(
+        entry
+        for entry in reopened.recent_history()["entries"]
+        if entry["id"] == original["entry_id"]
+    )
+    assert saved["serving_description"] == "1 bottle"
+    assert saved["source_type"] == "label"
+    assert saved["calories"] == "225.000"
+    assert saved["notes"] == "fixture note"
+    with reopened.database.connect() as connection:
+        assert connection.execute("SELECT revision FROM sync_state").fetchone()[0] == 3
+        receipts = connection.execute("SELECT entry_id FROM logging_receipts").fetchall()
+        assert {row["entry_id"] for row in receipts} == {
+            original["entry_id"],
+            updated["entry_id"],
+            repeat["entry_id"],
+        }
+
+
+def test_logging_key_is_scoped_to_owner_and_operation(service: MacroService) -> None:
+    service.add_user("tester", "Fixture tester")
+    tester = MacroService(service.database, "tester")
+    first = service.log_new_food(
+        "Shake", "1 bottle", profile(), SourceType.LABEL, Decimal("1"), client_key="same"
+    )
+    second = tester.log_new_food(
+        "Shake", "1 cup", profile(), SourceType.MANUAL, Decimal("2"), client_key="same"
+    )
+    assert first["food_id"] != second["food_id"]
+    assert second["source_type"] == "manual"
+    with pytest.raises(MacroError, match=r"^unknown food$"):
+        tester.log_known_food(first["food_id"], Decimal("1"), client_key="same")
+    with pytest.raises(MacroError, match=r"^unknown food$"):
+        tester.log_known_food(999, Decimal("1"), client_key="same")
+    third = tester.log_known_food(second["food_id"], Decimal("2"), client_key="same")
+    assert third["entry_id"] != second["entry_id"]
+    assert len(service.recent_history()["entries"]) == 1
+    assert len(tester.recent_history()["entries"]) == 2
+
+
+@pytest.mark.parametrize("new_food", [False, True])
+def test_concurrent_logging_replays_one_commit(service: MacroService, new_food: bool) -> None:
+    food_id = None
+    if not new_food:
+        food_id = service.add_item("Shake", "1 bottle", profile(), SourceType.LABEL)["item_id"]
+    start = Barrier(2, timeout=5)
+
+    def submit() -> dict:
+        worker = MacroService(service.database)
+        start.wait()
+        if food_id is None:
+            return worker.log_new_food(
+                "Shake", "1 bottle", profile(), SourceType.LABEL, Decimal("2"), client_key="retry"
+            )
+        return worker.log_known_food(food_id, Decimal("2"), client_key="retry")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first, second = pool.submit(submit), pool.submit(submit)
+        assert first.result(timeout=10) == second.result(timeout=10)
+
+    assert len(service.recent_history()["entries"]) == 1
+    assert len(service.search_items("Shake")["items"]) == 1
+    with service.database.connect() as connection:
+        assert connection.execute("SELECT revision FROM sync_state").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM logging_receipts").fetchone()[0] == 1
+
+
+def test_atomic_new_food_rolls_back_if_receipt_write_fails(service: MacroService) -> None:
+    with service.database.connect() as connection:
+        connection.execute(
+            """CREATE TRIGGER reject_receipt BEFORE INSERT ON logging_receipts
+            BEGIN SELECT RAISE(ABORT, 'fixture receipt failure'); END"""
+        )
+
+    def log() -> dict:
+        return service.log_new_food(
+            "Shake",
+            "1 bottle",
+            profile(),
+            SourceType.ESTIMATE,
+            Decimal("1.25"),
+            client_key="new-food",
+            source_notes="fixture estimate",
+        )
+
+    with pytest.raises(IntegrityError, match="fixture receipt failure"):
+        log()
+    assert service.search_items("Shake")["items"] == []
+    assert service.recent_history()["entries"] == []
+    with service.database.connect() as connection:
+        assert connection.execute("SELECT revision FROM sync_state").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM logging_receipts").fetchone()[0] == 0
+        connection.execute("DROP TRIGGER reject_receipt")
+
+    original = log()
+    assert log() == original
+    assert original["source_type"] == "estimate"
+    assert original["totals"]["calories"] == "187.500"
+    assert service.recent_history()["entries"][0]["source_notes"] == "fixture estimate"
+    with pytest.raises(MacroError, match="item already exists"):
+        service.log_new_food(
+            "shake", "1 cup", profile(), SourceType.MANUAL, Decimal("1"), client_key="duplicate"
+        )
+    with pytest.raises(MacroError, match="client key"):
+        service.log_known_food(original["food_id"], Decimal("1"), client_key=" ")
+    assert len(service.recent_history()["entries"]) == 1
