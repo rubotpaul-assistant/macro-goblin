@@ -61,6 +61,7 @@ TRACKING_SCHEMA = (
  source_type TEXT NOT NULL CHECK(source_type IN ('label','estimate','manual')),
  source_notes TEXT NOT NULL DEFAULT '',
  notes TEXT NOT NULL DEFAULT '',
+ profile_basis TEXT,
  FOREIGN KEY(food_item_id,user_id) REFERENCES food_items(id,user_id)
 )""",
     """CREATE INDEX IF NOT EXISTS ix_consumption_user_local_date
@@ -74,6 +75,23 @@ TRACKING_SCHEMA = (
  response_json TEXT NOT NULL,
  PRIMARY KEY(user_id,operation,client_key)
 )""",
+    """CREATE UNIQUE INDEX IF NOT EXISTS ix_consumption_id_owner
+    ON consumption_entries(id,user_id)""",
+    """CREATE TABLE IF NOT EXISTS consumption_changes (
+ user_id INTEGER NOT NULL,
+ entry_id INTEGER NOT NULL,
+ replacement_id INTEGER,
+ changed_at TEXT NOT NULL,
+ PRIMARY KEY(user_id,entry_id),
+ FOREIGN KEY(entry_id,user_id) REFERENCES consumption_entries(id,user_id),
+ FOREIGN KEY(replacement_id,user_id) REFERENCES consumption_entries(id,user_id)
+)""",
+    """CREATE VIEW IF NOT EXISTS active_consumption_entries AS
+ SELECT entries.* FROM consumption_entries AS entries
+ WHERE NOT EXISTS (
+    SELECT 1 FROM consumption_changes AS changes
+    WHERE changes.user_id=entries.user_id AND changes.entry_id=entries.id
+ )""",
 )
 
 SYNC_SCHEMA = """
@@ -120,6 +138,11 @@ class Database:
                     "ALTER TABLE sync_state ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"
                 )
             self._migrate_event_context(connection)
+            columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(consumption_entries)")
+            }
+            if "profile_basis" not in columns:
+                connection.execute("ALTER TABLE consumption_entries ADD COLUMN profile_basis TEXT")
             connection.commit()
             connection.execute("PRAGMA foreign_keys = ON")
             violations = connection.execute("PRAGMA foreign_key_check").fetchall()
