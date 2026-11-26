@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from hashlib import sha256
 from sqlite3 import Connection, IntegrityError, Row
 from typing import Any, cast
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from macro_tracker.db import Database
 from macro_tracker.domain import MacroProfile, SourceType
@@ -29,10 +30,26 @@ class StaleFoodProfile(MacroError):
     """The requested food profile version has been replaced."""
 
 
+@dataclass(frozen=True)
+class ConsumptionTime:
+    consumed_at: str
+    local_date: str
+    time_zone: str
+    historical_date_explicit: bool
+    occurred_at_utc: str | None
+    offset_minutes: int | None
+
+
 class MacroService:
     """Own all canonical macro-tracking mutations and queries."""
 
-    def __init__(self, database: Database, user_slug: str = "geoff") -> None:
+    def __init__(
+        self, database: Database, user_slug: str = "geoff", *, time_zone: str = PACIFIC.key
+    ) -> None:
+        try:
+            self.time_zone = ZoneInfo(time_zone)
+        except (ValueError, ZoneInfoNotFoundError) as error:
+            raise MacroError("invalid account time zone") from error
         self.database = database
         self.database.initialize()
         with self.database.connect() as connection:
@@ -202,13 +219,13 @@ class MacroService:
     ) -> dict[str, Any]:
         """Log one item with an immutable scaled snapshot."""
         self._validate_servings(servings)
-        timestamp = self._pacific_timestamp(consumed_at)
+        event_time = self._event_time(consumed_at)
         with self.database.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             item = self._find_item_by_name(connection, name, active_only=True)
             if item is None:
                 raise MacroError(f"unknown item: {name}")
-            return self._insert_snapshot(connection, item, servings, timestamp, notes)
+            return self._insert_snapshot(connection, item, servings, event_time, notes)
 
     def log_known_food(
         self,
@@ -218,6 +235,7 @@ class MacroService:
         client_key: str,
         expected_profile_version: int | None = None,
         consumed_at: datetime | None = None,
+        historical_date: date | None = None,
         notes: str = "",
     ) -> dict[str, Any]:
         """Log an active food by owner-scoped ID, with an optional version precondition."""
@@ -242,6 +260,7 @@ class MacroService:
             {"food_id": food_id, "expected_profile_version": expected_profile_version},
             servings,
             consumed_at,
+            historical_date,
             notes,
             resolve_item,
         )
@@ -257,6 +276,7 @@ class MacroService:
         client_key: str,
         source_notes: str = "",
         consumed_at: datetime | None = None,
+        historical_date: date | None = None,
         notes: str = "",
     ) -> dict[str, Any]:
         """Create a food definition and log its first consumption atomically."""
@@ -287,6 +307,7 @@ class MacroService:
             },
             servings,
             consumed_at,
+            historical_date,
             notes,
             resolve_item,
         )
@@ -298,19 +319,23 @@ class MacroService:
         food_input: dict[str, Any],
         servings: Decimal,
         consumed_at: datetime | None,
+        historical_date: date | None,
         notes: str,
         resolve_item: Callable[[Connection], Row],
     ) -> dict[str, Any]:
         if not client_key.strip() or len(client_key) > 128:
             raise MacroError("client key must contain 1 to 128 characters")
         self._validate_servings(servings)
-        timestamp = self._pacific_timestamp(consumed_at)
+        event_time = self._event_time(consumed_at, historical_date)
         payload = {
             **food_input,
             "servings": format(servings, ".3f"),
-            "consumed_at": None if consumed_at is None else timestamp.astimezone(UTC).isoformat(),
+            "consumed_at": None if consumed_at is None else consumed_at.astimezone(UTC).isoformat(),
             "notes": notes,
         }
+        # Preserve the fingerprint for receipts created before explicit dates were supported.
+        if historical_date is not None:
+            payload["historical_date"] = historical_date.isoformat()
         request_hash = sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
         receipt_key = (self.user_id, operation, client_key)
         with self.database.connect() as connection:
@@ -328,11 +353,15 @@ class MacroService:
 
             item = resolve_item(connection)
             result = {
-                **self._insert_snapshot(connection, item, servings, timestamp, notes),
+                **self._insert_snapshot(connection, item, servings, event_time, notes),
                 "food_id": item["id"],
                 "profile_version": item["profile_version"],
-                "consumed_at": timestamp.isoformat(),
-                "local_date": timestamp.date().isoformat(),
+                "consumed_at": event_time.consumed_at,
+                "local_date": event_time.local_date,
+                "time_zone": event_time.time_zone,
+                "historical_date_explicit": event_time.historical_date_explicit,
+                "occurred_at_utc": event_time.occurred_at_utc,
+                "offset_minutes": event_time.offset_minutes,
                 "source_type": item["source_type"],
             }
             connection.execute(
@@ -355,19 +384,34 @@ class MacroService:
         if isinstance(exponent, int) and exponent < -3:
             raise MacroError("servings support at most three decimal places")
 
-    @staticmethod
-    def _pacific_timestamp(consumed_at: datetime | None) -> datetime:
-        timestamp = consumed_at or datetime.now(tz=PACIFIC)
-        if timestamp.utcoffset() is None:
+    def _event_time(
+        self, consumed_at: datetime | None, historical_date: date | None = None
+    ) -> ConsumptionTime:
+        if consumed_at is None and historical_date is not None:
+            day = historical_date.isoformat()
+            return ConsumptionTime(day, day, self.time_zone.key, True, None, None)
+
+        timestamp = consumed_at or datetime.now(tz=self.time_zone)
+        offset = timestamp.utcoffset()
+        if offset is None:
             raise MacroError("consumed-at timestamp must include a timezone")
-        return timestamp.astimezone(PACIFIC)
+        localized = timestamp.astimezone(self.time_zone)
+        offset_minutes, remainder = divmod(offset.total_seconds(), 60)
+        return ConsumptionTime(
+            localized.isoformat(),
+            (historical_date or localized.date()).isoformat(),
+            self.time_zone.key,
+            historical_date is not None,
+            timestamp.astimezone(UTC).isoformat(timespec="microseconds"),
+            None if remainder else int(offset_minutes),
+        )
 
     def _insert_snapshot(
         self,
         connection: Connection,
         item: Row,
         servings: Decimal,
-        timestamp: datetime,
+        event_time: ConsumptionTime,
         notes: str,
     ) -> dict[str, Any]:
         profile = MacroProfile(
@@ -380,14 +424,19 @@ class MacroService:
         values = profile.as_strings()
         cursor = connection.execute(
             """INSERT INTO consumption_entries(
-                user_id,food_item_id,consumed_at,local_date,item_name,serving_description,servings,
+            user_id,food_item_id,consumed_at,local_date,time_zone,historical_date_explicit,
+            occurred_at_utc,offset_minutes,item_name,serving_description,servings,
                 calories,protein_g,carbs_g,fat_g,fiber_g,source_type,source_notes,notes
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 self.user_id,
                 item["id"],
-                timestamp.isoformat(),
-                timestamp.date().isoformat(),
+                event_time.consumed_at,
+                event_time.local_date,
+                event_time.time_zone,
+                event_time.historical_date_explicit,
+                event_time.occurred_at_utc,
+                event_time.offset_minutes,
                 item["name"],
                 item["serving_description"],
                 format(servings, "f"),
@@ -412,23 +461,39 @@ class MacroService:
             "user_slug": self.user_slug,
         }
 
-    def recent_history(self, limit: int = 20) -> dict[str, Any]:
+    def recent_history(
+        self, limit: int = 20, *, include_event_context: bool = False
+    ) -> dict[str, Any]:
         """Return recent item-level consumption snapshots."""
         if limit < 1 or limit > 100:
             raise MacroError("limit must be between 1 and 100")
         with self.database.connect() as connection:
             rows = connection.execute(
                 """SELECT id,consumed_at,local_date,item_name,serving_description,servings,
-                calories,protein_g,carbs_g,fat_g,fiber_g,source_type,source_notes,notes
+                calories,protein_g,carbs_g,fat_g,fiber_g,source_type,source_notes,notes,
+                time_zone,historical_date_explicit,occurred_at_utc,offset_minutes
                 FROM consumption_entries WHERE user_id=?
-                ORDER BY consumed_at DESC,id DESC LIMIT ?""",
+                ORDER BY local_date DESC,occurred_at_utc DESC,id DESC LIMIT ?""",
                 (self.user_id, limit),
             ).fetchall()
         entries = [{"user_slug": self.user_slug, **dict(row)} for row in rows]
+        for entry in entries:
+            if include_event_context:
+                entry["historical_date_explicit"] = bool(entry["historical_date_explicit"])
+            else:
+                for field in (
+                    "time_zone",
+                    "historical_date_explicit",
+                    "occurred_at_utc",
+                    "offset_minutes",
+                ):
+                    del entry[field]
         return {"ok": True, "user_slug": self.user_slug, "entries": entries}
 
-    def daily_summary(self, local_date: str) -> dict[str, Any]:
-        """Aggregate stored snapshots for one Pacific local date."""
+    def daily_summary(self, local_date: str | None = None) -> dict[str, Any]:
+        """Aggregate snapshots for a stored local day, defaulting to the account's today."""
+        if local_date is None:
+            local_date = datetime.now(tz=self.time_zone).date().isoformat()
         try:
             parsed_date = date.fromisoformat(local_date)
         except ValueError as error:
