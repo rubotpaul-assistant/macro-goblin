@@ -7,6 +7,8 @@ from typing import Any
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from mcp import ClientSession
+from mcp.client.streamable_http import streamable_http_client
 from typer.testing import CliRunner
 
 from macro_tracker.access import AccessUnavailable, Account, Authorizer, Consent, Scope
@@ -15,6 +17,7 @@ from macro_tracker.api import create_app
 from macro_tracker.cli import app as cli
 from macro_tracker.db import Database
 from macro_tracker.domain import MacroProfile, SourceType
+from macro_tracker.mcp_server import create_mcp_app
 from macro_tracker.service import MacroService
 
 pytestmark = pytest.mark.anyio
@@ -318,3 +321,130 @@ async def test_stale_profile_and_invalid_range_are_safe(
     )
     assert invalid.status_code == 422
     assert invalid.json() == {"error": {"code": "INVALID_INPUT"}}
+
+
+async def test_mcp_tools_replay_the_same_http_receipt(
+    context: tuple[AsyncClient, FixtureAccess, Database],
+) -> None:
+    http, provider, database = context
+    endpoint = f"{AUDIENCE}/mcp"
+    mcp_provider = Authorizer(provider, ISSUER, endpoint)
+    alternate_client = provider.connect("west", "mcp")
+    provider.tokens[alternate_client] = replace(
+        provider.tokens[alternate_client], audience=endpoint
+    )
+    app = create_mcp_app(database, mcp_provider)
+    original = (await http.post("/v1/foods/logs", headers=bearer("west-first"), json=FOOD)).json()
+
+    async with (
+        app.router.lifespan_context(app),
+        AsyncClient(transport=ASGITransport(app=app), base_url=AUDIENCE) as client,
+    ):
+        unauthorized = await client.post("/mcp")
+        assert unauthorized.status_code == 401
+        metadata_path = "/.well-known/oauth-protected-resource/mcp"
+        assert unauthorized.headers["WWW-Authenticate"] == (
+            f'Bearer resource_metadata="{AUDIENCE}{metadata_path}"'
+        )
+        metadata = (await client.get(metadata_path)).json()
+        assert metadata["resource"] == endpoint
+        assert metadata["authorization_servers"] == [ISSUER]
+        assert set(metadata["scopes_supported"]) == SCOPES
+        wrong_audience = await client.post("/mcp", headers=bearer("west-first"))
+        assert wrong_audience.status_code == 401
+        client.headers.update(bearer(alternate_client))
+
+        async with (
+            streamable_http_client(endpoint, http_client=client) as (incoming, outgoing, _),
+            ClientSession(incoming, outgoing) as session,
+        ):
+            initialized = await session.initialize()
+            assert initialized.serverInfo.name == "Macro Goblin"
+            tools = {tool.name: tool for tool in (await session.list_tools()).tools}
+            assert set(tools) == {
+                "macro_search_foods",
+                "macro_read_history",
+                "macro_daily_totals",
+                "macro_log_known_food",
+                "macro_log_new_food",
+            }
+            assert tools["macro_log_new_food"].inputSchema["properties"]["servings"]["type"] == (
+                "string"
+            )
+            assert tools["macro_log_known_food"].annotations.idempotentHint is True
+            assert tools["macro_read_history"].annotations.readOnlyHint is True
+            replay = await session.call_tool("macro_log_new_food", FOOD)
+            assert replay.isError is False
+            assert replay.structuredContent == original
+            search = await session.call_tool("macro_search_foods", {"query": "crisp"})
+            assert search.structuredContent["items"][0]["id"] == original["food_id"]
+            known = await session.call_tool(
+                "macro_log_known_food",
+                {
+                    "food_id": original["food_id"],
+                    "client_key": "known",
+                    "servings": "0.5",
+                    "historical_date": LOG_DAY,
+                },
+            )
+            assert known.structuredContent["totals"]["calories"] == "65.000"
+            history = await session.call_tool(
+                "macro_read_history", {"start_date": LOG_DAY, "end_date": LOG_DAY}
+            )
+            assert len(history.structuredContent["entries"]) == 2
+            summary = await session.call_tool("macro_daily_totals", {"day": LOG_DAY})
+            assert summary.structuredContent["totals"]["calories"] == "227.500"
+            invalid = await session.call_tool(
+                "macro_log_new_food", {**FOOD, "name": "Fixture missing amount", "servings": None}
+            )
+            assert invalid.isError is True
+            assert invalid.structuredContent == {"error": {"code": "INVALID_INPUT"}}
+            provider.consents[alternate_client] = replace(
+                provider.consents[alternate_client], scopes=frozenset({Scope.READ})
+            )
+            denied = await session.call_tool("macro_log_new_food", FOOD)
+            assert denied.structuredContent == {"error": {"code": "INSUFFICIENT_SCOPE"}}
+
+        provider.consents.pop(alternate_client)
+        revoked = await client.post("/mcp")
+        assert revoked.status_code == 403
+        assert revoked.json() == {"error": {"code": "ACCESS_DENIED"}}
+
+
+async def test_mcp_owner_scope_and_origin_check(
+    context: tuple[AsyncClient, FixtureAccess, Database],
+) -> None:
+    http, provider, database = context
+    endpoint = f"{AUDIENCE}/mcp"
+    west = (await http.post("/v1/foods/logs", headers=bearer("west-first"), json=FOOD)).json()
+    east = (
+        await http.post(
+            "/v1/foods/logs", headers=bearer("east-first"), json={**FOOD, "calories": "80"}
+        )
+    ).json()
+    connection = provider.connect("east", "mcp")
+    provider.tokens[connection] = replace(provider.tokens[connection], audience=endpoint)
+    app = create_mcp_app(database, Authorizer(provider, ISSUER, endpoint))
+    async with (
+        app.router.lifespan_context(app),
+        AsyncClient(
+            transport=ASGITransport(app=app), base_url=AUDIENCE, headers=bearer(connection)
+        ) as client,
+    ):
+        origin_denied = await client.post(
+            "/mcp", headers={"Origin": "https://other.fixture.invalid"}, json={}
+        )
+        assert origin_denied.status_code == 403
+        async with (
+            streamable_http_client(endpoint, http_client=client) as (incoming, outgoing, _),
+            ClientSession(incoming, outgoing) as session,
+        ):
+            await session.initialize()
+            search = await session.call_tool("macro_search_foods", {"query": "crisp"})
+            assert [item["id"] for item in search.structuredContent["items"]] == [east["food_id"]]
+            foreign = await session.call_tool(
+                "macro_log_known_food",
+                {"food_id": west["food_id"], "client_key": "foreign", "servings": "1"},
+            )
+            assert foreign.structuredContent == {"error": {"code": "NOT_FOUND"}}
+            assert foreign.isError is True

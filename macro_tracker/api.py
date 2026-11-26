@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StringConstraints
 
-from macro_tracker.access import AccessDenied, AccessUnavailable, Authorizer, Scope
+from macro_tracker.access import AccessDenied, AccessUnavailable, Account, Authorizer, Scope
 from macro_tracker.db import Database
 from macro_tracker.domain import MacroProfile, SourceType
 from macro_tracker.service import (
@@ -161,6 +161,49 @@ def _error(status: int, code: str) -> JSONResponse:
     return JSONResponse({"error": {"code": code}}, status_code=status, headers=headers)
 
 
+def domain_error_status(error: MacroError) -> tuple[int, str]:
+    return {
+        FoodNotFound: (404, "NOT_FOUND"),
+        FoodAlreadyExists: (409, "FOOD_ALREADY_EXISTS"),
+        LoggingReplayConflict: (409, "REPLAY_CONFLICT"),
+        StaleFoodProfile: (409, "STALE_FOOD_PROFILE"),
+    }.get(type(error), (422, "INVALID_INPUT"))
+
+
+def account_service(database: Database, account: Account) -> MacroService:
+    try:
+        return MacroService(database, account.macro_user_slug, time_zone=account.time_zone)
+    except MacroError as error:
+        raise AccessUnavailable() from error
+
+
+def record_known_food(service: MacroService, food_id: int, data: KnownFoodInput) -> dict[str, Any]:
+    return service.log_known_food(
+        food_id,
+        Decimal(data.servings),
+        client_key=data.client_key,
+        expected_profile_version=data.expected_profile_version,
+        consumed_at=data.timestamp(),
+        historical_date=data.historical_date,
+        notes=data.notes,
+    )
+
+
+def record_new_food(service: MacroService, data: NewFoodInput) -> dict[str, Any]:
+    return service.log_new_food(
+        data.name,
+        data.serving_description,
+        data.profile(),
+        data.source_type,
+        Decimal(data.servings),
+        client_key=data.client_key,
+        source_notes=data.source_notes,
+        consumed_at=data.timestamp(),
+        historical_date=data.historical_date,
+        notes=data.notes,
+    )
+
+
 def create_app(database: Database, authorizer: Authorizer) -> FastAPI:
     """Build an app with an injected trusted account integration and no projection routes."""
     app = FastAPI(
@@ -185,23 +228,14 @@ def create_app(database: Database, authorizer: Authorizer) -> FastAPI:
 
     @app.exception_handler(MacroError)
     async def domain_error(request: Request, error: MacroError) -> JSONResponse:
-        status, code = {
-            FoodNotFound: (404, "NOT_FOUND"),
-            FoodAlreadyExists: (409, "FOOD_ALREADY_EXISTS"),
-            LoggingReplayConflict: (409, "REPLAY_CONFLICT"),
-            StaleFoodProfile: (409, "STALE_FOOD_PROFILE"),
-        }.get(type(error), (422, "INVALID_INPUT"))
-        return _error(status, code)
+        return _error(*domain_error_status(error))
 
     def service_for(scope: Scope) -> Any:
         def resolve(
             credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(BEARER)],
         ) -> MacroService:
             account = authorizer.require(credentials.credentials if credentials else None, scope)
-            try:
-                return MacroService(database, account.macro_user_slug, time_zone=account.time_zone)
-            except MacroError as error:
-                raise AccessUnavailable() from error
+            return account_service(database, account)
 
         return Depends(resolve)
 
@@ -237,29 +271,10 @@ def create_app(database: Database, authorizer: Authorizer) -> FastAPI:
         data: KnownFoodInput,
         service: MacroService = write,
     ) -> dict[str, Any]:
-        return service.log_known_food(
-            food_id,
-            Decimal(data.servings),
-            client_key=data.client_key,
-            expected_profile_version=data.expected_profile_version,
-            consumed_at=data.timestamp(),
-            historical_date=data.historical_date,
-            notes=data.notes,
-        )
+        return record_known_food(service, food_id, data)
 
     @app.post("/v1/foods/logs", response_model=LoggedFood, operation_id="macro_log_new_food")
     def log_new_food(data: NewFoodInput, service: MacroService = write) -> dict[str, Any]:
-        return service.log_new_food(
-            data.name,
-            data.serving_description,
-            data.profile(),
-            data.source_type,
-            Decimal(data.servings),
-            client_key=data.client_key,
-            source_notes=data.source_notes,
-            consumed_at=data.timestamp(),
-            historical_date=data.historical_date,
-            notes=data.notes,
-        )
+        return record_new_food(service, data)
 
     return app

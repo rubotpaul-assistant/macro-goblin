@@ -69,6 +69,17 @@ class AccessProvider(Protocol):
 
 
 @dataclass(frozen=True)
+class AuthorizedConnection:
+    account: Account
+    scopes: frozenset[str]
+
+    def require(self, scope: Scope) -> Account:
+        if scope not in self.scopes:
+            raise AccessDenied("INSUFFICIENT_SCOPE", 403)
+        return self.account
+
+
+@dataclass(frozen=True)
 class Authorizer:
     provider: AccessProvider
     issuer: str
@@ -76,6 +87,10 @@ class Authorizer:
 
     def require(self, bearer: str | None, scope: Scope) -> Account:
         """Check current access before exposing any catalog data or replay receipt."""
+        return self.active_connection(bearer).require(scope)
+
+    def active_connection(self, bearer: str | None) -> AuthorizedConnection:
+        """Resolve the current account and the intersection of token and consent scopes."""
         access = self.provider.verify(bearer) if bearer else None
         if (
             access is None
@@ -95,6 +110,4 @@ class Authorizer:
             != (account.account_id, "macro", access.client_id)
         ):
             raise AccessDenied("ACCESS_DENIED", 403)
-        if scope not in access.scopes or scope not in consent.scopes:
-            raise AccessDenied("INSUFFICIENT_SCOPE", 403)
-        return account
+        return AuthorizedConnection(account, access.scopes & consent.scopes)
