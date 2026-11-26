@@ -89,8 +89,8 @@ class SheetsService:
             """SELECT users.slug,consumed_at,local_date,item_name,serving_description,servings,
             calories,
             protein_g,carbs_g,fat_g,fiber_g,source_type,source_notes,notes
-            FROM consumption_entries JOIN users ON users.id=consumption_entries.user_id
-            ORDER BY consumed_at,consumption_entries.id"""
+            FROM active_consumption_entries AS entries JOIN users ON users.id=entries.user_id
+            ORDER BY consumed_at,entries.id"""
         ).fetchall()
         return [header, *[list(record) for record in records]]
 

@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from hashlib import sha256
@@ -16,6 +16,7 @@ from macro_tracker.db import Database
 from macro_tracker.domain import MacroProfile, SourceType
 
 PACIFIC = ZoneInfo("America/Los_Angeles")
+NUTRIENT_FIELDS = ("calories", "protein_g", "carbs_g", "fat_g", "fiber_g")
 
 
 class MacroError(Exception):
@@ -38,6 +39,26 @@ class FoodAlreadyExists(MacroError):
     """A food with the same name already exists in the owner's catalog."""
 
 
+class ConsumptionNotFound(MacroError):
+    """An entry ID is absent from this owner's history."""
+
+
+class StaleConsumption(MacroError):
+    """The selected snapshot was already corrected."""
+
+
+class DeletedConsumption(MacroError):
+    """The selected consumption was deleted."""
+
+
+class DeletionConfirmationRequired(MacroError):
+    """The owner must explicitly confirm deletion of this entry."""
+
+
+class MissingServingProfile(MacroError):
+    """An older snapshot needs its original serving profile for a quantity correction."""
+
+
 @dataclass(frozen=True)
 class ConsumptionTime:
     consumed_at: str
@@ -46,6 +67,14 @@ class ConsumptionTime:
     historical_date_explicit: bool
     occurred_at_utc: str | None
     offset_minutes: int | None
+
+
+@dataclass(frozen=True)
+class ConsumptionCorrection:
+    servings: Decimal | None = None
+    historical_date: date | None = None
+    notes: str | None = None
+    original_profile: MacroProfile | None = None
 
 
 class MacroService:
@@ -331,8 +360,6 @@ class MacroService:
         notes: str,
         resolve_item: Callable[[Connection], Row],
     ) -> dict[str, Any]:
-        if not client_key.strip() or len(client_key) > 128:
-            raise MacroError("client key must contain 1 to 128 characters")
         self._validate_servings(servings)
         event_time = self._event_time(consumed_at, historical_date)
         payload = {
@@ -344,34 +371,48 @@ class MacroService:
         # Preserve the fingerprint for receipts created before explicit dates were supported.
         if historical_date is not None:
             payload["historical_date"] = historical_date.isoformat()
+
+        def record(connection: Connection) -> dict[str, Any]:
+            item = resolve_item(connection)
+            return {
+                **self._insert_snapshot(connection, item, servings, event_time, notes),
+                "food_id": item["id"],
+                "profile_version": item["profile_version"],
+                **asdict(event_time),
+                "source_type": item["source_type"],
+            }
+
+        return self._write_with_receipt(operation, client_key, payload, record, check_deleted=True)
+
+    def _write_with_receipt(
+        self,
+        operation: str,
+        client_key: str,
+        payload: dict[str, Any],
+        record: Callable[[Connection], dict[str, Any]],
+        *,
+        check_deleted: bool,
+    ) -> dict[str, Any]:
+        if not client_key.strip() or len(client_key) > 128:
+            raise MacroError("client key must contain 1 to 128 characters")
         request_hash = sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
         receipt_key = (self.user_id, operation, client_key)
         with self.database.connect() as connection:
             # Reserve the write before deciding whether to replay or create a snapshot.
             connection.execute("BEGIN IMMEDIATE")
             receipt = connection.execute(
-                """SELECT request_hash,response_json FROM logging_receipts
+                """SELECT request_hash,response_json,entry_id FROM logging_receipts
                 WHERE user_id=? AND operation=? AND client_key=?""",
                 receipt_key,
             ).fetchone()
             if receipt is not None:
                 if receipt["request_hash"] != request_hash:
                     raise LoggingReplayConflict("client key already used for different input")
+                if check_deleted and self._is_deleted(connection, receipt["entry_id"]):
+                    raise DeletedConsumption("consumption was deleted")
                 return cast(dict[str, Any], json.loads(receipt["response_json"]))
 
-            item = resolve_item(connection)
-            result = {
-                **self._insert_snapshot(connection, item, servings, event_time, notes),
-                "food_id": item["id"],
-                "profile_version": item["profile_version"],
-                "consumed_at": event_time.consumed_at,
-                "local_date": event_time.local_date,
-                "time_zone": event_time.time_zone,
-                "historical_date_explicit": event_time.historical_date_explicit,
-                "occurred_at_utc": event_time.occurred_at_utc,
-                "offset_minutes": event_time.offset_minutes,
-                "source_type": item["source_type"],
-            }
+            result = record(connection)
             connection.execute(
                 """INSERT INTO logging_receipts(
                 user_id,operation,client_key,request_hash,entry_id,response_json
@@ -379,6 +420,144 @@ class MacroService:
                 (*receipt_key, request_hash, result["entry_id"], json.dumps(result)),
             )
         return result
+
+    def _is_deleted(self, connection: Connection, entry_id: int) -> bool:
+        """Follow correction links to see whether an entry was later deleted."""
+        return (
+            connection.execute(
+                """WITH RECURSIVE versions(id) AS (
+                    SELECT ?
+                    UNION ALL
+                    SELECT change.replacement_id FROM consumption_changes AS change
+                    JOIN versions ON versions.id=change.entry_id
+                    WHERE change.user_id=? AND change.replacement_id IS NOT NULL
+                )
+                SELECT 1 FROM consumption_changes AS change
+                JOIN versions ON versions.id=change.entry_id
+                WHERE change.user_id=? AND change.replacement_id IS NULL""",
+                (entry_id, self.user_id, self.user_id),
+            ).fetchone()
+            is not None
+        )
+
+    def _current_entry(self, connection: Connection, entry_id: int) -> Row:
+        entry = connection.execute(
+            """SELECT entry.*,change.entry_id AS changed,change.replacement_id
+            FROM consumption_entries AS entry
+            LEFT JOIN consumption_changes AS change
+                ON change.entry_id=entry.id AND change.user_id=entry.user_id
+            WHERE entry.id=? AND entry.user_id=?""",
+            (entry_id, self.user_id),
+        ).fetchone()
+        if entry is None:
+            raise ConsumptionNotFound("unknown consumption")
+        if entry["changed"] is not None:
+            if entry["replacement_id"] is None:
+                raise DeletedConsumption("consumption was deleted")
+            raise StaleConsumption("consumption was corrected; read history again")
+        return cast(Row, entry)
+
+    def correct_consumption(
+        self, entry_id: int, correction: ConsumptionCorrection, *, client_key: str
+    ) -> dict[str, Any]:
+        """Append a corrected snapshot and record which entry it replaces."""
+        if correction.servings is not None:
+            self._validate_servings(correction.servings)
+        elif correction.original_profile is not None:
+            raise MacroError("an original profile is only needed for a quantity correction")
+        if (
+            correction.servings is None
+            and correction.historical_date is None
+            and correction.notes is None
+        ):
+            raise MacroError("at least one correction is required")
+        day = correction.historical_date.isoformat() if correction.historical_date else None
+        supplied_basis = correction.original_profile
+        payload = {
+            "entry_id": entry_id,
+            "servings": (
+                format(correction.servings, ".3f") if correction.servings is not None else None
+            ),
+            "historical_date": day,
+            "notes": correction.notes,
+            "original_profile": supplied_basis.as_strings() if supplied_basis is not None else None,
+        }
+
+        def record(connection: Connection) -> dict[str, Any]:
+            entry = self._current_entry(connection, entry_id)
+            event_time = ConsumptionTime(
+                consumed_at=day
+                if day and entry["occurred_at_utc"] is None
+                else entry["consumed_at"],
+                local_date=day or entry["local_date"],
+                time_zone=entry["time_zone"],
+                historical_date_explicit=bool(day or entry["historical_date_explicit"]),
+                occurred_at_utc=entry["occurred_at_utc"],
+                offset_minutes=entry["offset_minutes"],
+            )
+            basis = entry["profile_basis"]
+            servings = entry["servings"]
+            values = {field: entry[field] for field in NUTRIENT_FIELDS}
+            if correction.servings is not None:
+                if basis is not None:
+                    if supplied_basis is not None:
+                        raise MacroError("the snapshot already has its original serving profile")
+                    profile = self._profile_from_values(json.loads(basis))
+                elif supplied_basis is not None:
+                    profile = supplied_basis
+                    original = profile.scale(Decimal(entry["servings"])).as_strings()
+                    if any(
+                        Decimal(original[field]) != Decimal(values[field])
+                        for field in NUTRIENT_FIELDS
+                    ):
+                        raise MacroError("original per-serving values do not match the snapshot")
+                    basis = json.dumps(profile.as_strings())
+                else:
+                    raise MissingServingProfile("original per-serving values are required")
+                servings = format(correction.servings, "f")
+                values = profile.scale(correction.servings).as_strings()
+            notes = entry["notes"] if correction.notes is None else correction.notes
+            saved = self._save_snapshot(
+                connection, entry, servings, event_time, notes, values, basis
+            )
+            self._mark_entry_changed(connection, entry_id, saved["entry_id"])
+            return {
+                **saved,
+                "previous_entry_id": entry_id,
+                "food_id": entry["food_item_id"],
+                **asdict(event_time),
+                "source_type": entry["source_type"],
+            }
+
+        return self._write_with_receipt(
+            "correct_consumption", client_key, payload, record, check_deleted=True
+        )
+
+    def delete_consumption(
+        self, entry_id: int, *, client_key: str, confirmed: bool
+    ) -> dict[str, Any]:
+        """Void one selected snapshot after explicit confirmation."""
+        if confirmed is not True:
+            raise DeletionConfirmationRequired("confirm deletion of the selected entry")
+
+        def record(connection: Connection) -> dict[str, Any]:
+            self._current_entry(connection, entry_id)
+            self._mark_entry_changed(connection, entry_id, None)
+            self._advance_revision(connection)
+            return {"entry_id": entry_id, "deleted": True}
+
+        return self._write_with_receipt(
+            "delete_consumption", client_key, {"entry_id": entry_id}, record, check_deleted=False
+        )
+
+    def _mark_entry_changed(
+        self, connection: Connection, entry_id: int, replacement_id: int | None
+    ) -> None:
+        connection.execute(
+            """INSERT INTO consumption_changes(user_id,entry_id,replacement_id,changed_at)
+            VALUES(?,?,?,?)""",
+            (self.user_id, entry_id, replacement_id, datetime.now(tz=UTC).isoformat()),
+        )
 
     @staticmethod
     def _validate_servings(servings: Decimal) -> None:
@@ -422,52 +601,75 @@ class MacroService:
         event_time: ConsumptionTime,
         notes: str,
     ) -> dict[str, Any]:
-        profile = MacroProfile(
-            Decimal(item["calories"]),
-            Decimal(item["protein_g"]),
-            Decimal(item["carbs_g"]),
-            Decimal(item["fat_g"]),
-            Decimal(item["fiber_g"]),
-        ).scale(servings)
-        values = profile.as_strings()
+        profile = self._profile_from_values(item)
+        source = {**dict(item), "food_item_id": item["id"], "item_name": item["name"]}
+        return self._save_snapshot(
+            connection,
+            source,
+            format(servings, "f"),
+            event_time,
+            notes,
+            profile.scale(servings).as_strings(),
+            json.dumps(profile.as_strings()),
+        )
+
+    @staticmethod
+    def _profile_from_values(values: Row | Mapping[str, str]) -> MacroProfile:
+        return MacroProfile(*(Decimal(values[field]) for field in NUTRIENT_FIELDS))
+
+    def _save_snapshot(
+        self,
+        connection: Connection,
+        source: Row | Mapping[str, Any],
+        servings: str,
+        event_time: ConsumptionTime,
+        notes: str,
+        values: dict[str, str],
+        basis: str | None,
+    ) -> dict[str, Any]:
         cursor = connection.execute(
             """INSERT INTO consumption_entries(
             user_id,food_item_id,consumed_at,local_date,time_zone,historical_date_explicit,
             occurred_at_utc,offset_minutes,item_name,serving_description,servings,
-                calories,protein_g,carbs_g,fat_g,fiber_g,source_type,source_notes,notes
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            calories,protein_g,carbs_g,fat_g,fiber_g,source_type,source_notes,notes,profile_basis
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 self.user_id,
-                item["id"],
+                source["food_item_id"],
                 event_time.consumed_at,
                 event_time.local_date,
                 event_time.time_zone,
                 event_time.historical_date_explicit,
                 event_time.occurred_at_utc,
                 event_time.offset_minutes,
-                item["name"],
-                item["serving_description"],
-                format(servings, "f"),
+                source["item_name"],
+                source["serving_description"],
+                servings,
                 values["calories"],
                 values["protein_g"],
                 values["carbs_g"],
                 values["fat_g"],
                 values["fiber_g"],
-                item["source_type"],
-                item["source_notes"],
+                source["source_type"],
+                source["source_notes"],
                 notes,
+                basis,
             ),
         )
-        connection.execute("UPDATE sync_state SET pending=1,revision=revision+1 WHERE singleton=1")
+        self._advance_revision(connection)
         return {
             "ok": True,
             "entry_id": int(cursor.lastrowid or 0),
-            "item": item["name"],
-            "servings": format(servings, "f"),
+            "item": source["item_name"],
+            "servings": servings,
             "totals": values,
             "sync_pending": True,
             "user_slug": self.user_slug,
         }
+
+    @staticmethod
+    def _advance_revision(connection: Connection) -> None:
+        connection.execute("UPDATE sync_state SET pending=1,revision=revision+1 WHERE singleton=1")
 
     def recent_history(
         self,
@@ -489,7 +691,7 @@ class MacroService:
                 """SELECT id,consumed_at,local_date,item_name,serving_description,servings,
                 calories,protein_g,carbs_g,fat_g,fiber_g,source_type,source_notes,notes,
                 time_zone,historical_date_explicit,occurred_at_utc,offset_minutes
-                FROM consumption_entries WHERE user_id=?
+                FROM active_consumption_entries WHERE user_id=?
                 AND (? IS NULL OR local_date>=?) AND (? IS NULL OR local_date<=?)
                 ORDER BY local_date DESC,occurred_at_utc DESC,id DESC LIMIT ?""",
                 (self.user_id, lower, lower, upper, upper, limit),
@@ -521,7 +723,7 @@ class MacroService:
         with self.database.connect() as connection:
             rows = connection.execute(
                 """SELECT calories,protein_g,carbs_g,fat_g,fiber_g
-                FROM consumption_entries WHERE user_id=? AND local_date=?""",
+                FROM active_consumption_entries WHERE user_id=? AND local_date=?""",
                 (self.user_id, local_date),
             ).fetchall()
         totals = MacroProfile(
