@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 
 USERS_SCHEMA = """
@@ -45,6 +46,10 @@ TRACKING_SCHEMA = (
  food_item_id INTEGER NOT NULL,
  consumed_at TEXT NOT NULL,
  local_date TEXT NOT NULL,
+ time_zone TEXT NOT NULL DEFAULT 'America/Los_Angeles',
+ historical_date_explicit INTEGER NOT NULL DEFAULT 0 CHECK(historical_date_explicit IN (0,1)),
+ occurred_at_utc TEXT,
+ offset_minutes INTEGER,
  item_name TEXT NOT NULL,
  serving_description TEXT NOT NULL,
  servings TEXT NOT NULL,
@@ -114,6 +119,7 @@ class Database:
                 connection.execute(
                     "ALTER TABLE sync_state ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"
                 )
+            self._migrate_event_context(connection)
             connection.commit()
             connection.execute("PRAGMA foreign_keys = ON")
             violations = connection.execute("PRAGMA foreign_key_check").fetchall()
@@ -121,6 +127,42 @@ class Database:
                 raise sqlite3.IntegrityError("foreign key violation after database migration")
         finally:
             connection.close()
+
+    @staticmethod
+    def _migrate_event_context(connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(consumption_entries)")
+        }
+        if "time_zone" in columns:
+            return
+        connection.execute(
+            "ALTER TABLE consumption_entries ADD COLUMN time_zone "
+            "TEXT NOT NULL DEFAULT 'America/Los_Angeles'"
+        )
+        connection.execute(
+            "ALTER TABLE consumption_entries ADD COLUMN historical_date_explicit INTEGER "
+            "NOT NULL DEFAULT 0 CHECK(historical_date_explicit IN (0,1))"
+        )
+        connection.execute("ALTER TABLE consumption_entries ADD COLUMN occurred_at_utc TEXT")
+        connection.execute("ALTER TABLE consumption_entries ADD COLUMN offset_minutes INTEGER")
+        Database._backfill_event_instants(connection)
+
+    @staticmethod
+    def _backfill_event_instants(connection: sqlite3.Connection) -> None:
+        # The older schema retained the Pacific timestamp, but discarded the input offset.
+        rows = connection.execute("SELECT id,consumed_at FROM consumption_entries")
+        connection.executemany(
+            "UPDATE consumption_entries SET occurred_at_utc=? WHERE id=?",
+            (
+                (
+                    datetime.fromisoformat(row["consumed_at"])
+                    .astimezone(UTC)
+                    .isoformat(timespec="microseconds"),
+                    row["id"],
+                )
+                for row in rows
+            ),
+        )
 
     @staticmethod
     def _create_tracking_tables(connection: sqlite3.Connection) -> None:
@@ -159,6 +201,7 @@ class Database:
         )
         connection.execute("DROP TABLE legacy_consumption_entries")
         connection.execute("DROP TABLE legacy_food_items")
+        Database._backfill_event_instants(connection)
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:

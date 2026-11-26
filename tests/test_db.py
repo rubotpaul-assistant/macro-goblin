@@ -1,5 +1,7 @@
 import sqlite3
+from datetime import datetime
 from decimal import Decimal
+from json import dumps
 from pathlib import Path
 
 from macro_tracker.db import Database
@@ -85,12 +87,18 @@ def test_initialize_backfills_legacy_rows_to_geoff(tmp_path: Path) -> None:
         user = connection.execute("SELECT id,slug,display_name FROM users").fetchone()
         food = connection.execute("SELECT id,user_id FROM food_items").fetchone()
         entry = connection.execute(
-            "SELECT id,user_id,food_item_id FROM consumption_entries"
+            "SELECT id,user_id,food_item_id,time_zone,occurred_at_utc FROM consumption_entries"
         ).fetchone()
         foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
     assert dict(user) == {"id": 1, "slug": "geoff", "display_name": "Geoff"}
     assert dict(food) == {"id": 7, "user_id": 1}
-    assert dict(entry) == {"id": 9, "user_id": 1, "food_item_id": 7}
+    assert dict(entry) == {
+        "id": 9,
+        "user_id": 1,
+        "food_item_id": 7,
+        "time_zone": "America/Los_Angeles",
+        "occurred_at_utc": "2026-08-19T19:00:00.000000+00:00",
+    }
     assert foreign_key_errors == []
 
 
@@ -120,3 +128,40 @@ def test_initialize_upgrades_existing_owned_food_for_replay(tmp_path: Path) -> N
         )
         == logged
     )
+
+
+def test_initialize_preserves_pre_time_zone_receipts_and_local_days(tmp_path: Path) -> None:
+    database = Database(tmp_path / "pre-time-zone.sqlite3")
+    profile = MacroProfile(Decimal("50"), Decimal("2"), Decimal("3"), Decimal("1"))
+    operator = MacroService(database)
+    operator.add_user("tester", "Fixture tester")
+    service = MacroService(database, "tester")
+    food_id = service.add_item("Toast", "1 slice", profile, SourceType.LABEL)["item_id"]
+    timestamp = datetime.fromisoformat("2026-08-17T01:00:00.123456+00:00")
+    original = service.log_known_food(
+        food_id, Decimal("2"), client_key="old", consumed_at=timestamp
+    )
+    with database.connect() as connection:
+        connection.execute("ALTER TABLE consumption_entries DROP COLUMN time_zone")
+        connection.execute("ALTER TABLE consumption_entries DROP COLUMN historical_date_explicit")
+        connection.execute("ALTER TABLE consumption_entries DROP COLUMN occurred_at_utc")
+        connection.execute("ALTER TABLE consumption_entries DROP COLUMN offset_minutes")
+        for field in ("time_zone", "historical_date_explicit", "occurred_at_utc", "offset_minutes"):
+            del original[field]
+        connection.execute(
+            "UPDATE logging_receipts SET response_json=? WHERE user_id=? AND client_key=?",
+            (dumps(original), service.user_id, "old"),
+        )
+
+    moved = MacroService(database, "tester", time_zone="Europe/London")
+    assert (
+        moved.log_known_food(food_id, Decimal("2"), client_key="old", consumed_at=timestamp)
+        == original
+    )
+    entry = moved.recent_history(include_event_context=True)["entries"][0]
+    assert entry["id"] == original["entry_id"]
+    assert entry["local_date"] == "2026-08-16"
+    assert entry["time_zone"] == "America/Los_Angeles"
+    assert entry["occurred_at_utc"] == "2026-08-17T01:00:00.123456+00:00"
+    assert entry["offset_minutes"] is None
+    assert moved.daily_summary("2026-08-16")["totals"]["calories"] == "100.000"
