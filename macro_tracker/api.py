@@ -3,13 +3,20 @@
 from datetime import date, datetime
 from decimal import Decimal
 from sqlite3 import Error as SQLiteError
-from typing import Annotated, Any
+from typing import Annotated, Any, Self
 
 from fastapi import Depends, FastAPI, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StringConstraints
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    model_validator,
+)
 
 from macro_tracker.access import AccessDenied, AccessUnavailable, Account, Authorizer, Scope
 from macro_tracker.db import Database
@@ -48,7 +55,7 @@ class LogInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     client_key: str = Field(min_length=1, max_length=128)
-    servings: DecimalInput
+    servings: DecimalInput = Field(description="Amount consumed in units of the declared serving.")
     consumed_at: OffsetTimestamp | None = None
     historical_date: LocalDate | None = None
     notes: str = Field(default="", max_length=2000)
@@ -65,15 +72,35 @@ class KnownFoodInput(LogInput):
 
 
 class NewFoodInput(LogInput):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "if": {"properties": {"source_type": {"const": "label"}}},
+            "then": {"required": ["fiber_g"]},
+        }
+    )
+
     name: str = Field(min_length=1, max_length=200)
-    serving_description: str = Field(min_length=1, max_length=200)
+    serving_description: str = Field(
+        min_length=1, max_length=200, description="Serving size for the submitted nutrient values."
+    )
     calories: DecimalInput
     protein_g: DecimalInput
     carbs_g: DecimalInput
     fat_g: DecimalInput
-    fiber_g: DecimalInput = "0"
-    source_type: SourceType
+    fiber_g: DecimalInput = Field(
+        default="0", description="Dietary fiber per serving. Required for label provenance."
+    )
+    source_type: SourceType = Field(
+        description="Use label for clear nutrition facts, estimate for an assistant estimate, "
+        "or manual for values explicitly supplied as manual."
+    )
     source_notes: str = Field(default="", max_length=2000)
+
+    @model_validator(mode="after")
+    def require_label_fiber(self) -> Self:
+        if self.source_type is SourceType.LABEL and "fiber_g" not in self.model_fields_set:
+            raise ValueError("label provenance requires a fiber value")
+        return self
 
     def profile(self) -> MacroProfile:
         try:
@@ -273,7 +300,17 @@ def create_app(database: Database, authorizer: Authorizer) -> FastAPI:
     ) -> dict[str, Any]:
         return record_known_food(service, food_id, data)
 
-    @app.post("/v1/foods/logs", response_model=LoggedFood, operation_id="macro_log_new_food")
+    @app.post(
+        "/v1/foods/logs",
+        response_model=LoggedFood,
+        operation_id="macro_log_new_food",
+        description=(
+            "Log a clear label and known amount directly when asked. Submit structured nutrient "
+            "values per serving and the amount consumed in servings. Ask for the missing detail "
+            "when the food identity, serving size, nutrient values, or consumed amount is unclear. "
+            "Use estimate provenance for an assistant estimate that the user asks to log."
+        ),
+    )
     def log_new_food(data: NewFoodInput, service: MacroService = write) -> dict[str, Any]:
         return record_new_food(service, data)
 
