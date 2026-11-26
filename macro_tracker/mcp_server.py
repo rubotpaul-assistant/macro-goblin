@@ -139,6 +139,10 @@ OPERATIONS: dict[str, Operation[Any]] = {
     ),
     "macro_log_new_food": Operation(
         "Create a food from structured per-serving values and log the portion in one action. "
+        "When the user asks to log and the label and quantity are clear, log directly with label "
+        "provenance. Ask only for the missing or ambiguous detail when needed. "
+        "Use estimate provenance for an assistant estimate the user asks to log. "
+        "The assistant reads the image and sends structured values. "
         "Send the same client key and values to retry.",
         NutritionScope.WRITE,
         NewFoodInput,

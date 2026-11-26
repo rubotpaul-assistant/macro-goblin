@@ -33,6 +33,7 @@ FOOD = {
     "protein_g": "4",
     "carbs_g": "12",
     "fat_g": "2",
+    "fiber_g": "1",
     "source_type": "label",
     "servings": "1.25",
     "client_key": "fixture-log",
@@ -448,3 +449,53 @@ async def test_mcp_owner_scope_and_origin_check(
             )
             assert foreign.structuredContent == {"error": {"code": "NOT_FOUND"}}
             assert foreign.isError is True
+
+
+async def test_label_transcription_requires_complete_values_and_an_amount(
+    context: tuple[AsyncClient, FixtureAccess, Database],
+) -> None:
+    client, _, database = context
+    headers = bearer("west-first")
+    # These values match tests/fixtures/fixture-crisp-label.jpg.
+    for omitted in ("name", "serving_description", "fiber_g", "servings"):
+        incomplete = {key: value for key, value in FOOD.items() if key != omitted}
+        rejected = await client.post("/v1/foods/logs", headers=headers, json=incomplete)
+        assert rejected.status_code == 422
+        assert rejected.json() == {"error": {"code": "INVALID_INPUT"}}
+    image_request = {**FOOD, "image": "fixture-crisp-label.jpg"}
+    assert (
+        await client.post("/v1/foods/logs", headers=headers, json=image_request)
+    ).status_code == 422
+    assert (await client.get("/v1/foods", headers=headers)).json() == {"items": []}
+    assert (await client.get("/v1/history", headers=headers)).json() == {"entries": []}
+
+    verified = await client.post("/v1/foods/logs", headers=headers, json=FOOD)
+    assert verified.status_code == 200
+    receipt = verified.json()
+    assert receipt["source_type"] == "label"
+    assert receipt["totals"] == {
+        "calories": "162.500",
+        "protein_g": "5.000",
+        "carbs_g": "15.000",
+        "fat_g": "2.500",
+        "fiber_g": "1.250",
+    }
+    owner = MacroService(database, "west")
+    owner.add_item(
+        FOOD["name"],
+        "1 bowl",
+        MacroProfile(Decimal("20"), Decimal("4"), Decimal("0"), Decimal("0")),
+        SourceType.ESTIMATE,
+        replace=True,
+    )
+    assert (await client.post("/v1/foods/logs", headers=headers, json=FOOD)).json() == receipt
+    entries = (await client.get("/v1/history", headers=headers)).json()["entries"]
+    assert len(entries) == 1
+    assert entries[0]["source_type"] == "label"
+    assert entries[0]["calories"] == "162.500"
+
+    estimate = {key: value for key, value in FOOD.items() if key != "fiber_g"}
+    estimate.update(name="Estimate crisp", source_type="estimate", client_key="estimate")
+    result = await client.post("/v1/foods/logs", headers=headers, json=estimate)
+    assert result.status_code == 200
+    assert result.json()["source_type"] == "estimate"
