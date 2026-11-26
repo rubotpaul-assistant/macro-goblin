@@ -6,6 +6,7 @@ import json
 from collections.abc import Callable
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Annotated, Any
 
 import typer
@@ -15,6 +16,7 @@ from macro_tracker.db import Database
 from macro_tracker.domain import MacroProfile, SourceType
 from macro_tracker.service import MacroError, MacroService
 from macro_tracker.sheets import GoogleSheetsWriter, SheetsService
+from macro_tracker.support import write_account_export
 
 app = typer.Typer(no_args_is_help=True)
 item_app = typer.Typer(no_args_is_help=True)
@@ -23,12 +25,14 @@ history_app = typer.Typer(no_args_is_help=True)
 summary_app = typer.Typer(no_args_is_help=True)
 sheets_app = typer.Typer(no_args_is_help=True)
 user_app = typer.Typer(no_args_is_help=True)
+support_app = typer.Typer(no_args_is_help=True)
 app.add_typer(item_app, name="item")
 app.add_typer(log_app, name="log")
 app.add_typer(history_app, name="history")
 app.add_typer(summary_app, name="summary")
 app.add_typer(sheets_app, name="sheets")
 app.add_typer(user_app, name="user")
+app.add_typer(support_app, name="support")
 
 
 def _service() -> MacroService:
@@ -79,6 +83,16 @@ def user_add(
 def user_list() -> None:
     """List active users."""
     _run(_admin_service().list_users)
+
+
+@support_app.command("export")
+def support_export(
+    owner_id: Annotated[int, typer.Option("--owner-id", min=1, max=2**63 - 1)],
+    output: Annotated[Path, typer.Option("--output")],
+) -> None:
+    """Write a private Macro archive for one verified owner."""
+    settings = Settings.from_environment()
+    _run(write_account_export, Database(settings.database_path), owner_id, output)
 
 
 @item_app.command("add")

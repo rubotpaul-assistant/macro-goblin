@@ -227,9 +227,10 @@ class Database:
         Database._backfill_event_instants(connection)
 
     @contextmanager
-    def connect(self) -> Iterator[sqlite3.Connection]:
+    def connect(self, *, read_only: bool = False) -> Iterator[sqlite3.Connection]:
         """Yield a transactional connection with foreign keys enabled."""
-        connection = sqlite3.connect(self.path)
+        target = f"{self.path.resolve().as_uri()}?mode=ro" if read_only else str(self.path)
+        connection = sqlite3.connect(target, uri=read_only)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         try:
