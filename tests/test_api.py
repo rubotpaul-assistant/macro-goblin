@@ -277,6 +277,8 @@ async def test_openapi_and_independent_scopes(
         "/v1/totals",
         "/v1/foods/{food_id}/logs",
         "/v1/foods/logs",
+        "/v1/consumptions/{entry_id}",
+        "/v1/consumptions/{entry_id}/delete",
     }
     assert schema["paths"]["/v1/foods/logs"]["post"]["security"] == [{"CreekMasonsAccess": []}]
     assert schema["components"]["schemas"]["NewFoodInput"]["properties"]["servings"]["type"] == (
@@ -368,12 +370,15 @@ async def test_mcp_tools_replay_the_same_http_receipt(
                 "macro_daily_totals",
                 "macro_log_known_food",
                 "macro_log_new_food",
+                "macro_correct_consumption",
+                "macro_delete_consumption",
             }
             assert tools["macro_log_new_food"].inputSchema["properties"]["servings"]["type"] == (
                 "string"
             )
             assert tools["macro_log_known_food"].annotations.idempotentHint is True
             assert tools["macro_read_history"].annotations.readOnlyHint is True
+            assert tools["macro_delete_consumption"].annotations.destructiveHint is True
             replay = await session.call_tool("macro_log_new_food", FOOD)
             assert replay.isError is False
             assert replay.structuredContent == original
@@ -499,3 +504,72 @@ async def test_label_transcription_requires_complete_values_and_an_amount(
     result = await client.post("/v1/foods/logs", headers=headers, json=estimate)
     assert result.status_code == 200
     assert result.json()["source_type"] == "estimate"
+
+
+async def test_correct_and_delete_the_same_entry_across_clients(
+    context: tuple[AsyncClient, FixtureAccess, Database],
+) -> None:
+    http, provider, database = context
+    west = bearer("west-first")
+    east = bearer("east-first")
+    original = (await http.post("/v1/foods/logs", headers=west, json=FOOD)).json()
+    edit_path = f"/v1/consumptions/{original['entry_id']}"
+    edit = {"client_key": "edit", "historical_date": "2026-08-12", "servings": "2"}
+    denied = await http.patch(edit_path, headers=east, json=edit)
+    assert denied.status_code == 404
+    assert denied.json() == {"error": {"code": "NOT_FOUND"}}
+    corrected = await http.patch(edit_path, headers=west, json=edit)
+    assert corrected.status_code == 200
+    receipt = corrected.json()
+    assert receipt["previous_entry_id"] == original["entry_id"]
+    assert receipt["local_date"] == "2026-08-12"
+    assert receipt["totals"]["calories"] == "260.000"
+    stale = await http.patch(edit_path, headers=west, json={**edit, "client_key": "different"})
+    assert stale.status_code == 409
+    assert stale.json() == {"error": {"code": "STALE_CONSUMPTION"}}
+    assert (await http.get(f"/v1/totals?day={LOG_DAY}", headers=west)).json()["item_count"] == 0
+    assert (await http.get("/v1/totals?day=2026-08-12", headers=west)).json()["item_count"] == 1
+
+    active_entry = receipt["entry_id"]
+    delete_path = f"/v1/consumptions/{active_entry}/delete"
+    foreign_delete = await http.post(
+        delete_path, headers=east, json={"client_key": "delete", "confirmed": True}
+    )
+    assert foreign_delete.status_code == 404
+    assert foreign_delete.json() == denied.json()
+    unconfirmed_http = await http.post(delete_path, headers=west, json={"client_key": "delete"})
+    assert unconfirmed_http.json() == {"error": {"code": "CONFIRMATION_REQUIRED"}}
+
+    endpoint = f"{AUDIENCE}/mcp"
+    connection = provider.connect("west", "mcp")
+    provider.tokens[connection] = replace(provider.tokens[connection], audience=endpoint)
+    app = create_mcp_app(database, Authorizer(provider, ISSUER, endpoint))
+    delete = {"entry_id": active_entry, "client_key": "delete"}
+    async with (
+        app.router.lifespan_context(app),
+        AsyncClient(
+            transport=ASGITransport(app=app), base_url=AUDIENCE, headers=bearer(connection)
+        ) as client,
+        streamable_http_client(endpoint, http_client=client) as (incoming, outgoing, _),
+        ClientSession(incoming, outgoing) as session,
+    ):
+        await session.initialize()
+        correction_replay = await session.call_tool(
+            "macro_correct_consumption", {**edit, "entry_id": original["entry_id"]}
+        )
+        assert correction_replay.structuredContent == receipt
+        unconfirmed = await session.call_tool("macro_delete_consumption", delete)
+        assert unconfirmed.structuredContent == {"error": {"code": "CONFIRMATION_REQUIRED"}}
+        deleted = await session.call_tool("macro_delete_consumption", {**delete, "confirmed": True})
+        assert deleted.structuredContent == {"entry_id": active_entry, "deleted": True}
+        history = await session.call_tool("macro_read_history")
+        assert history.structuredContent == {"entries": []}
+
+    retry = await http.post(
+        delete_path, headers=west, json={"client_key": "delete", "confirmed": True}
+    )
+    assert retry.json() == {"entry_id": active_entry, "deleted": True}
+    log_replay = await http.post("/v1/foods/logs", headers=west, json=FOOD)
+    assert log_replay.status_code == 410
+    assert log_replay.json() == {"error": {"code": "CONSUMPTION_DELETED"}}
+    assert (await http.get("/v1/totals?day=2026-08-12", headers=west)).json()["item_count"] == 0

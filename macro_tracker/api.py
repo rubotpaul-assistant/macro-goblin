@@ -22,11 +22,17 @@ from macro_tracker.access import AccessDenied, AccessUnavailable, Account, Autho
 from macro_tracker.db import Database
 from macro_tracker.domain import MacroProfile, SourceType
 from macro_tracker.service import (
+    ConsumptionCorrection,
+    ConsumptionNotFound,
+    DeletedConsumption,
+    DeletionConfirmationRequired,
     FoodAlreadyExists,
     FoodNotFound,
     LoggingReplayConflict,
     MacroError,
     MacroService,
+    MissingServingProfile,
+    StaleConsumption,
     StaleFoodProfile,
 )
 
@@ -38,6 +44,8 @@ OffsetTimestamp = Annotated[
         pattern=r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|[+-]\d{2}:\d{2})$"
     ),
 ]
+ClientKey = Annotated[str, StringConstraints(min_length=1, max_length=128)]
+EntryPath = Annotated[int, Path(gt=0, le=2**63 - 1)]
 
 
 def _parse_date(value: object) -> date:
@@ -54,7 +62,7 @@ LocalDate = Annotated[date, BeforeValidator(_parse_date)]
 class LogInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    client_key: str = Field(min_length=1, max_length=128)
+    client_key: ClientKey
     servings: DecimalInput = Field(description="Amount consumed in units of the declared serving.")
     consumed_at: OffsetTimestamp | None = None
     historical_date: LocalDate | None = None
@@ -71,7 +79,31 @@ class KnownFoodInput(LogInput):
     expected_profile_version: int | None = Field(default=None, gt=0, strict=True)
 
 
-class NewFoodInput(LogInput):
+class ServingProfileInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    calories: DecimalInput
+    protein_g: DecimalInput
+    carbs_g: DecimalInput
+    fat_g: DecimalInput
+    fiber_g: DecimalInput = Field(
+        default="0", description="Dietary fiber per serving. Required for label provenance."
+    )
+
+    def profile(self) -> MacroProfile:
+        try:
+            return MacroProfile(
+                Decimal(self.calories),
+                Decimal(self.protein_g),
+                Decimal(self.carbs_g),
+                Decimal(self.fat_g),
+                Decimal(self.fiber_g),
+            )
+        except ValueError as error:
+            raise MacroError("invalid nutrient profile") from error
+
+
+class NewFoodInput(LogInput, ServingProfileInput):
     model_config = ConfigDict(
         json_schema_extra={
             "if": {"properties": {"source_type": {"const": "label"}}},
@@ -82,13 +114,6 @@ class NewFoodInput(LogInput):
     name: str = Field(min_length=1, max_length=200)
     serving_description: str = Field(
         min_length=1, max_length=200, description="Serving size for the submitted nutrient values."
-    )
-    calories: DecimalInput
-    protein_g: DecimalInput
-    carbs_g: DecimalInput
-    fat_g: DecimalInput
-    fiber_g: DecimalInput = Field(
-        default="0", description="Dietary fiber per serving. Required for label provenance."
     )
     source_type: SourceType = Field(
         description="Use label for clear nutrition facts, estimate for an assistant estimate, "
@@ -102,17 +127,28 @@ class NewFoodInput(LogInput):
             raise ValueError("label provenance requires a fiber value")
         return self
 
-    def profile(self) -> MacroProfile:
-        try:
-            return MacroProfile(
-                Decimal(self.calories),
-                Decimal(self.protein_g),
-                Decimal(self.carbs_g),
-                Decimal(self.fat_g),
-                Decimal(self.fiber_g),
-            )
-        except ValueError as error:
-            raise MacroError("invalid nutrient profile") from error
+
+class CorrectionInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    client_key: ClientKey
+    servings: DecimalInput | None = Field(default=None, description="Corrected amount consumed.")
+    historical_date: LocalDate | None = None
+    notes: str | None = Field(default=None, max_length=2000)
+    original_profile: ServingProfileInput | None = Field(
+        default=None, description="Original per-serving values for an older entry when requested."
+    )
+
+
+class DeletionInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    client_key: ClientKey
+    confirmed: bool = Field(
+        default=False,
+        strict=True,
+        description="Set true only after the user explicitly confirms the selected deletion.",
+    )
 
 
 class NutrientValues(BaseModel):
@@ -145,14 +181,26 @@ class EventContext(BaseModel):
     offset_minutes: int | None = None
 
 
-class LoggedFood(EventContext):
+class ConsumptionResult(EventContext):
     entry_id: int
     food_id: int
-    profile_version: int
     item: str
     servings: str
     totals: NutrientValues
     source_type: SourceType
+
+
+class LoggedFood(ConsumptionResult):
+    profile_version: int
+
+
+class CorrectedConsumption(ConsumptionResult):
+    previous_entry_id: int
+
+
+class ConsumptionDeletion(BaseModel):
+    entry_id: int
+    deleted: bool
 
 
 class HistoryEntry(EventContext, NutrientValues):
@@ -191,9 +239,14 @@ def _error(status: int, code: str) -> JSONResponse:
 def domain_error_status(error: MacroError) -> tuple[int, str]:
     return {
         FoodNotFound: (404, "NOT_FOUND"),
+        ConsumptionNotFound: (404, "NOT_FOUND"),
         FoodAlreadyExists: (409, "FOOD_ALREADY_EXISTS"),
         LoggingReplayConflict: (409, "REPLAY_CONFLICT"),
         StaleFoodProfile: (409, "STALE_FOOD_PROFILE"),
+        StaleConsumption: (409, "STALE_CONSUMPTION"),
+        DeletedConsumption: (410, "CONSUMPTION_DELETED"),
+        DeletionConfirmationRequired: (422, "CONFIRMATION_REQUIRED"),
+        MissingServingProfile: (422, "MISSING_SERVING_PROFILE"),
     }.get(type(error), (422, "INVALID_INPUT"))
 
 
@@ -231,12 +284,28 @@ def record_new_food(service: MacroService, data: NewFoodInput) -> dict[str, Any]
     )
 
 
+def apply_correction(service: MacroService, entry_id: int, data: CorrectionInput) -> dict[str, Any]:
+    correction = ConsumptionCorrection(
+        servings=Decimal(data.servings) if data.servings is not None else None,
+        historical_date=data.historical_date,
+        notes=data.notes,
+        original_profile=data.original_profile.profile() if data.original_profile else None,
+    )
+    return service.correct_consumption(entry_id, correction, client_key=data.client_key)
+
+
+def apply_deletion(service: MacroService, entry_id: int, data: DeletionInput) -> dict[str, Any]:
+    return service.delete_consumption(
+        entry_id, client_key=data.client_key, confirmed=data.confirmed
+    )
+
+
 def create_app(database: Database, authorizer: Authorizer) -> FastAPI:
     """Build an app with an injected trusted account integration and no projection routes."""
     app = FastAPI(
         title="Macro Goblin",
         version="1",
-        responses={code: {"model": ErrorResponse} for code in (401, 403, 404, 409, 422, 503)},
+        responses={code: {"model": ErrorResponse} for code in (401, 403, 404, 409, 410, 422, 503)},
     )
 
     @app.exception_handler(AccessDenied)
@@ -313,5 +382,25 @@ def create_app(database: Database, authorizer: Authorizer) -> FastAPI:
     )
     def log_new_food(data: NewFoodInput, service: MacroService = write) -> dict[str, Any]:
         return record_new_food(service, data)
+
+    @app.patch(
+        "/v1/consumptions/{entry_id}",
+        response_model=CorrectedConsumption,
+        operation_id="macro_correct_consumption",
+    )
+    def correct(
+        entry_id: EntryPath, data: CorrectionInput, service: MacroService = write
+    ) -> dict[str, Any]:
+        return apply_correction(service, entry_id, data)
+
+    @app.post(
+        "/v1/consumptions/{entry_id}/delete",
+        response_model=ConsumptionDeletion,
+        operation_id="macro_delete_consumption",
+    )
+    def delete(
+        entry_id: EntryPath, data: DeletionInput, service: MacroService = write
+    ) -> dict[str, Any]:
+        return apply_deletion(service, entry_id, data)
 
     return app
