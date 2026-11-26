@@ -30,6 +30,14 @@ class StaleFoodProfile(MacroError):
     """The requested food profile version has been replaced."""
 
 
+class FoodNotFound(MacroError):
+    """The active food is absent from the owner's catalog."""
+
+
+class FoodAlreadyExists(MacroError):
+    """A food with the same name already exists in the owner's catalog."""
+
+
 @dataclass(frozen=True)
 class ConsumptionTime:
     consumed_at: str
@@ -246,7 +254,7 @@ class MacroService:
                 (self.user_id, food_id),
             ).fetchone()
             if item is None:
-                raise MacroError("unknown food")
+                raise FoodNotFound("unknown food")
             if (
                 expected_profile_version is not None
                 and item["profile_version"] != expected_profile_version
@@ -284,7 +292,7 @@ class MacroService:
 
         def resolve_item(connection: Connection) -> Row:
             if self._find_item_by_name(connection, name) is not None:
-                raise MacroError(f"item already exists: {name}")
+                raise FoodAlreadyExists(f"item already exists: {name}")
             return self._insert_item(
                 connection,
                 name,
@@ -462,19 +470,29 @@ class MacroService:
         }
 
     def recent_history(
-        self, limit: int = 20, *, include_event_context: bool = False
+        self,
+        limit: int = 20,
+        *,
+        include_event_context: bool = False,
+        start_date: date | None = None,
+        end_date: date | None = None,
     ) -> dict[str, Any]:
-        """Return recent item-level consumption snapshots."""
+        """Return recent consumption snapshots within the optional inclusive local-date range."""
         if limit < 1 or limit > 100:
             raise MacroError("limit must be between 1 and 100")
+        if start_date is not None and end_date is not None and start_date > end_date:
+            raise MacroError("start date must precede or equal end date")
+        lower = start_date.isoformat() if start_date is not None else None
+        upper = end_date.isoformat() if end_date is not None else None
         with self.database.connect() as connection:
             rows = connection.execute(
                 """SELECT id,consumed_at,local_date,item_name,serving_description,servings,
                 calories,protein_g,carbs_g,fat_g,fiber_g,source_type,source_notes,notes,
                 time_zone,historical_date_explicit,occurred_at_utc,offset_minutes
                 FROM consumption_entries WHERE user_id=?
+                AND (? IS NULL OR local_date>=?) AND (? IS NULL OR local_date<=?)
                 ORDER BY local_date DESC,occurred_at_utc DESC,id DESC LIMIT ?""",
-                (self.user_id, limit),
+                (self.user_id, lower, lower, upper, upper, limit),
             ).fetchall()
         entries = [{"user_slug": self.user_slug, **dict(row)} for row in rows]
         for entry in entries:
