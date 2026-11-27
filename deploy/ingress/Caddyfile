@@ -21,6 +21,18 @@
 		}
 	}
 
+	@iron {
+		host {$MCP_HOST:mcp.example.test}
+		path /iron-goblin /.well-known/oauth-protected-resource/iron-goblin
+		expression `"{$IRON_ENABLED:0}" == "1"`
+	}
+	handle @iron {
+		reverse_proxy {$IRON_UPSTREAM:iron.railway.internal:8080} {
+			header_up X-Forwarded-Proto https
+			flush_interval -1
+		}
+	}
+
 	handle {
 		respond 404
 	}
