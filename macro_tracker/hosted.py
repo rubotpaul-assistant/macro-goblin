@@ -1,6 +1,7 @@
 """Private Macro MCP process for the Creekmasons staging pilot."""
 
 import os
+import socket
 from dataclasses import dataclass
 from pathlib import Path
 from sqlite3 import Error as SQLiteError
@@ -135,14 +136,27 @@ def main() -> None:
             service_key,
             client,
         )
-        uvicorn.run(
-            create_hosted_app(database, authorizer),
-            host=os.environ.get("MACRO_BIND_HOST", "::"),
-            port=int(os.environ.get("PORT", "8080")),
+        app = create_hosted_app(database, authorizer)
+        host = os.environ.get("MACRO_BIND_HOST", "::")
+        port = int(os.environ.get("PORT", "8080"))
+        config = uvicorn.Config(
+            app,
+            host=host,
+            port=port,
             access_log=False,
             proxy_headers=False,
-            log_level="warning",
         )
+        server = uvicorn.Server(config)
+        if host != "::":
+            server.run()
+            return
+        # asyncio's default IPv6 socket is IPv6-only. Railway health checks can
+        # arrive over IPv4 while private services reach the listener over IPv6.
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            listener.bind((host, port))
+            server.run(sockets=[listener])
 
 
 if __name__ == "__main__":
