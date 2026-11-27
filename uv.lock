@@ -803,6 +803,12 @@ dev = [
     { name = "pytest-cov" },
     { name = "ruff" },
 ]
+hosted = [
+    { name = "fastapi" },
+    { name = "httpx" },
+    { name = "mcp" },
+    { name = "uvicorn" },
+]
 mcp = [
     { name = "fastapi" },
     { name = "mcp" },
@@ -816,10 +822,13 @@ sheets = [
 requires-dist = [
     { name = "bandit", marker = "extra == 'dev'", specifier = ">=1.8,<2" },
     { name = "fastapi", marker = "extra == 'api'", specifier = ">=0.116,<1" },
+    { name = "fastapi", marker = "extra == 'hosted'", specifier = ">=0.116,<1" },
     { name = "fastapi", marker = "extra == 'mcp'", specifier = ">=0.116,<1" },
     { name = "google-api-python-client", marker = "extra == 'sheets'", specifier = ">=2.170,<3" },
     { name = "google-auth", marker = "extra == 'sheets'", specifier = ">=2.40,<3" },
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.28,<1" },
+    { name = "httpx", marker = "extra == 'hosted'", specifier = ">=0.28,<1" },
+    { name = "mcp", marker = "extra == 'hosted'", specifier = ">=1.30,<2" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.30,<2" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.15,<2" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=4.2,<5" },
@@ -827,8 +836,9 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=6.1,<7" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.11,<1" },
     { name = "typer", specifier = ">=0.16,<1" },
+    { name = "uvicorn", marker = "extra == 'hosted'", specifier = ">=0.34,<1" },
 ]
-provides-extras = ["api", "mcp", "sheets", "dev"]
+provides-extras = ["api", "mcp", "hosted", "sheets", "dev"]
 
 [[package]]
 name = "markdown-it-py"

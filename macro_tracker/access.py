@@ -79,6 +79,14 @@ class AuthorizedConnection:
         return self.account
 
 
+class ConnectionAuthorizer(Protocol):
+    @property
+    def issuer(self) -> str: ...
+    @property
+    def audience(self) -> str: ...
+    def active_connection(self, bearer: str | None) -> AuthorizedConnection: ...
+
+
 @dataclass(frozen=True)
 class Authorizer:
     provider: AccessProvider
