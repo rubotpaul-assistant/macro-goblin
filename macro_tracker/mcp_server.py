@@ -22,7 +22,12 @@ from starlette.routing import Route
 from starlette.types import Receive, Send
 from starlette.types import Scope as ASGIScope
 
-from macro_tracker.access import AccessDenied, AccessUnavailable, AuthorizedConnection, Authorizer
+from macro_tracker.access import (
+    AccessDenied,
+    AccessUnavailable,
+    AuthorizedConnection,
+    ConnectionAuthorizer,
+)
 from macro_tracker.access import Scope as NutritionScope
 from macro_tracker.api import (
     ConsumptionDeletion,
@@ -197,7 +202,7 @@ def _tool_error(code: str) -> types.CallToolResult:
 @dataclass(frozen=True)
 class _AuthorizedTransport:
     manager: StreamableHTTPSessionManager
-    authorizer: Authorizer
+    authorizer: ConnectionAuthorizer
     metadata_url: str
 
     async def __call__(self, scope: ASGIScope, receive: Receive, send: Send) -> None:
@@ -227,7 +232,7 @@ class _AuthorizedTransport:
 
 
 def create_mcp_app(
-    database: Database, authorizer: Authorizer, *, allowed_origins: tuple[str, ...] = ()
+    database: Database, authorizer: ConnectionAuthorizer, *, allowed_origins: tuple[str, ...] = ()
 ) -> Starlette:
     """Build the stateless transport at the configured Macro resource URL."""
     resource = urlsplit(authorizer.audience)

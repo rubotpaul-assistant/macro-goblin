@@ -1,0 +1,27 @@
+{
+	admin off
+	auto_https off
+}
+
+:{$PORT:8080} {
+	@health path /healthz
+	handle @health {
+		respond "ok" 200
+	}
+
+	@macro {
+		host {$MCP_HOST:mcp.example.test}
+		path /macro-goblin /.well-known/oauth-protected-resource/macro-goblin
+		expression `"{$MACRO_ENABLED:0}" == "1"`
+	}
+	handle @macro {
+		reverse_proxy {$MACRO_UPSTREAM:macro.railway.internal:8080} {
+			header_up X-Forwarded-Proto https
+			flush_interval -1
+		}
+	}
+
+	handle {
+		respond 404
+	}
+}
