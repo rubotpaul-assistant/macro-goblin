@@ -9,6 +9,12 @@ validation, scaling, persistence, aggregation, and sync-state management. An age
 a nutrition label or estimate a complex meal, but it must declare the provenance as `label`,
 `estimate`, or `manual`; the application never silently invents nutrition data.
 
+Macro Goblin also contains authorized HTTP and MCP adapters, replay-safe meal writes, label-first
+logging, governed correction/deletion workflows, support export, and a recovery rehearsal. These
+are private-pilot building blocks, not a hosted production service. See
+[Launch readiness](docs/launch-readiness.md) for the current evidence, remaining gates, and launch
+recommendation.
+
 ## Data model
 
 - **Food item:** a reusable per-serving nutrient profile, such as one protein shake, hamburger, or
@@ -19,7 +25,8 @@ a nutrition label or estimate a complex meal, but it must declare the provenance
 - **Sync state:** records whether canonical SQLite changes still need projection.
 
 All nutrient arithmetic uses `Decimal`; JSON and SQLite store normalized fixed-point strings.
-Consumption dates use `America/Los_Angeles`.
+HTTP consumption dates use the authorized account binding's IANA time zone. Local CLI operations
+currently default to `America/Los_Angeles`.
 
 ## Development
 
